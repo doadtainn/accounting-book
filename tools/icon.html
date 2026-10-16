@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  App 圖示原始檔：用 Edge 無頭模式截圖產生 PNG（尺寸由網址 ?size= 指定）
+  msedge --headless=new --disable-gpu --hide-scrollbars --window-size=600,600 --screenshot=icon.png "file:///.../tools/icon.html?size=180"
+  iOS 會自己裁圓角，所以這裡畫滿版正方形。
+-->
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: #000; }
+  .icon {
+    position: relative; overflow: hidden;
+    background: linear-gradient(145deg, #3c8dbc 0%, #24658f 55%, #173f5a 100%);
+    font-family: "Microsoft JhengHei", "PingFang TC", sans-serif;
+  }
+  .icon .text {
+    position: absolute; left: 0; right: 0; text-align: center; color: #fff; font-weight: 700;
+    letter-spacing: 0.04em; text-shadow: 0 0.02em 0.06em rgba(0, 0, 0, .35);
+  }
+  .icon svg { position: absolute; left: 0; top: 0; }
+</style>
+<div class="icon" id="icon">
+  <svg id="chart" viewBox="0 0 100 100" preserveAspectRatio="none">
+    <!-- 底部的上升折線與長條，代表收支與資產 -->
+    <rect x="18" y="72" width="9" height="12" rx="1.5" fill="rgba(255,255,255,.22)"/>
+    <rect x="32" y="66" width="9" height="18" rx="1.5" fill="rgba(255,255,255,.22)"/>
+    <rect x="46" y="69" width="9" height="15" rx="1.5" fill="rgba(255,255,255,.22)"/>
+    <rect x="60" y="61" width="9" height="23" rx="1.5" fill="rgba(255,255,255,.22)"/>
+    <rect x="74" y="55" width="9" height="29" rx="1.5" fill="rgba(255,255,255,.22)"/>
+    <polyline points="20,74 36,66 50,69 64,60 80,52" fill="none" stroke="#7fe0b0" stroke-width="3.2"
+      stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="80" cy="52" r="3.6" fill="#7fe0b0"/>
+  </svg>
+  <div class="text" id="text">記帳</div>
+</div>
+<script>
+  const size = Number(new URLSearchParams(location.search).get("size")) || 512;
+  const icon = document.getElementById("icon");
+  icon.style.width = icon.style.height = `${size}px`;
+  const chart = document.getElementById("chart");
+  chart.setAttribute("width", size);
+  chart.setAttribute("height", size);
+  const text = document.getElementById("text");
+  text.style.fontSize = `${size * 0.28}px`;
+  text.style.top = `${size * 0.09}px`;
+</script>

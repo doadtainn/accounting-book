@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>記帳本</title>
+<!-- 手機 App（PWA）：加入主畫面後以全螢幕開啟 -->
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="記帳本">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#1f2429">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="main-header">
+    <a href="#/" class="logo"><b>記帳</b>本</a>
+    <nav class="navbar">
+      <button class="sidebar-toggle" id="sidebarToggle" aria-label="切換選單">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="nav-right">
+        <!-- 隱私模式：金額變成 *****（狀態記在這台裝置） -->
+        <button class="nav-btn nav-icon" id="privacyToggle" type="button" aria-pressed="false" title="隱藏金額"></button>
+        <a href="#/calendar" class="nav-btn nav-icon" id="calendarLink" title="行事曆" aria-label="行事曆"></a>
+        <a href="#/new" class="nav-btn">＋ 新增交易</a>
+      </div>
+    </nav>
+  </header>
+
+  <aside class="main-sidebar">
+    <ul class="sidebar-menu" id="menu"></ul>
+  </aside>
+  <div class="sidebar-backdrop" id="backdrop"></div>
+
+  <div class="content-wrapper">
+    <section class="content-header" id="contentHeader"></section>
+    <div class="alerts" id="alerts"></div>
+    <section class="content" id="content"></section>
+    <footer class="main-footer"><strong>記帳本</strong> · 資料儲存在本機 SQLite</footer>
+  </div>
+
+<script src="js/vendor/Sortable.min.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

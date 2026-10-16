@@ -1,0 +1,26 @@
+# 個人資料：記帳資料庫、個人環境說明（絕對不要上傳）
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+CLAUDE.local.md
+.claude/
+
+# 打包產物與建置環境
+release/
+packaging/.venv/
+packaging/build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# 測試用暫存頁（static/_xxx.html）
+static/_*
+
+# 系統檔
+Thumbs.db
+desktop.ini
+.DS_Store
