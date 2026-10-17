@@ -6,6 +6,7 @@
 import calendar
 import ipaddress
 import json
+import os
 import re
 import socket
 import sqlite3
@@ -20,7 +21,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-PORT = 5000
+PORT = int(os.environ.get("LEDGER_PORT", "5000"))  # 同一台機器放多個專案時可用環境變數換連接埠
 BASE = Path(__file__).parent
 DB_PATH = BASE / "data" / "ledger.db"
 STATIC = BASE / "static"

@@ -1,0 +1,2 @@
+# Linux 用的腳本一律 LF 換行（Windows 上編輯也一樣），否則樹莓派執行會出錯
+*.sh text eol=lf

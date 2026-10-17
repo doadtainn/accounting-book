@@ -20,7 +20,7 @@
 
 ## 安裝與啟動（Windows）
 
-1. 安裝 [Python](https://www.python.org/downloads/)（3.12 以上）。安裝時記得勾選 **「Add python.exe to PATH」**。
+1. 安裝 [Python](https://www.python.org/downloads/)（3.11 以上）。安裝時記得勾選 **「Add python.exe to PATH」**。
 2. 下載本專案：按頁面上方綠色的 **Code → Download ZIP**，解壓縮到任意資料夾。
    （會用 git 的話：`git clone` 這個儲存庫）
 3. 雙擊資料夾裡的 **`start.bat`**。
@@ -29,11 +29,32 @@
 
 看到黑色視窗顯示「記帳本已啟動」就代表成功。**使用期間不要關掉這個視窗**（可以縮小）。
 
-> macOS／Linux：安裝 Python 3.12 以上後，在專案資料夾執行 `python3 server.py`。
+> macOS／Linux：安裝 Python 3.11 以上後，在專案資料夾執行 `python3 server.py`。長期執行建議放在樹莓派，見下方。
 
 ### 開機自動啟動（選用，Windows）
 
 按 `Win + R` 輸入 `shell:startup`，把 `start.bat` 的捷徑放進打開的資料夾。
+
+## 放在樹莓派長期執行（建議）
+
+記帳本每天會定時更新股價、匯率並記錄資產變化，放在一直開著的樹莓派（或任何 Linux 主機）最適合，不怕 Windows 更新重開機。
+
+```bash
+# 1. 下載（需要 git 與 Python 3.11 以上；Raspberry Pi OS 都已內建 Python）
+sudo apt install -y git
+git clone https://github.com/doadtainn/accounting-book.git ~/accounting-book
+cd ~/accounting-book
+
+# 2.（搬家才需要）把舊電腦的 data/ledger.db 複製到 ~/accounting-book/data/
+
+# 3. 安裝成系統服務：開機自動啟動、當掉自動重啟、每天 03:30 自動備份到 backups/（保留 30 份）
+bash deploy/raspberry-pi/install.sh
+```
+
+- 更新到最新版：`bash deploy/raspberry-pi/update.sh`（會先備份資料再更新）
+- 看執行記錄：`journalctl -u ledger -f`；重開：`sudo systemctl restart ledger`
+- 換連接埠（同一台放多個專案時）：`LEDGER_PORT=5050 bash deploy/raspberry-pi/install.sh`
+- 在外面用：樹莓派裝 [Tailscale](https://tailscale.com/download/linux)，手機用樹莓派的 Tailscale IP 連線
 
 ## 用手機連線（選用）
 
@@ -48,7 +69,7 @@ iPhone 用 Safari 開啟後按「分享 → 加入主畫面」，就能像 App �
 ## 資料與備份
 
 - 所有資料都在 **`data/ledger.db`**（第一次啟動時自動建立）。
-- 備份：把 `data/ledger.db` 複製一份到別的地方即可。
+- 備份：執行 `python tools/backup.py`（伺服器執行中也能安全備份，存到 `backups/`，保留最新 30 份；`--dest` 可指定其他資料夾），或關掉伺服器後直接複製 `data/ledger.db`。
 - 換電腦：把 `ledger.db` 放到新電腦的 `data/` 資料夾。
 - 更新程式版本時，保留 `data/` 資料夾，其他檔案換成新版即可。
 
@@ -72,6 +93,8 @@ iPhone 用 Safari 開啟後按「分享 → 加入主畫面」，就能像 App �
 | `server.py` | 後端：資料庫、API、股價與匯率查詢、每日排程（只用 Python 標準函式庫） |
 | `static/` | 前端：`index.html`、`js/app.js`（單一檔案，無建置工具）、`css/style.css`、`js/i18n.js`（英日翻譯） |
 | `tools/test_server.py` | 開發用：複製資料庫到暫存檔，在 5001 跑測試伺服器 |
+| `tools/backup.py` | 備份資料庫（SQLite 線上備份，保留最新 N 份） |
+| `deploy/raspberry-pi/` | 樹莓派／Linux 安裝成系統服務（`install.sh`）與更新（`update.sh`） |
 | `packaging/` | 實驗性：用 PyInstaller 打包成 Windows 安裝程式（沒有程式碼簽章，可能被 Windows 擋下） |
 | `CLAUDE.md` | 開發說明（架構、資料模型、記帳規則、慣例） |
 

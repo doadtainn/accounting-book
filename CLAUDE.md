@@ -13,7 +13,8 @@
 
 ## 執行
 
-- 啟動：`start.bat`（= `python server.py`），port **5000**，瀏覽器開 `http://localhost:5000`。需要 Python 3.12 以上。
+- 啟動：`start.bat`（= `python server.py`），port **5000**（環境變數 `LEDGER_PORT` 可改），瀏覽器開 `http://localhost:5000`。需要 **Python 3.11 以上**（樹莓派 Bookworm 是 3.11）：不要用 3.12 才有的語法，例如 f-string 大括號裡用同一種引號。
+- Linux／樹莓派：`deploy/raspberry-pi/install.sh` 裝成 systemd 服務 `ledger.service`（`Restart=always`）＋ `ledger-backup.timer`（每天 03:30 `tools/backup.py --keep 30`，`Persistent=true`）；`update.sh` 先備份再 `git pull --ff-only` 並重開。`.gitattributes` 讓 `.sh` 保持 LF。
 - 存取限制（`Handler._allowed`）：只接受私有 IP（本機、區網）與 Tailscale 網段，其他公網 IP 回 403。
 - **記帳本沒有登入功能，不能公開到網際網路**（例如 Tailscale Funnel、路由器轉發）。反向代理進來的連線在伺服器看來是 127.0.0.1，會被放行，所以要公開一定要先做登入驗證。
 
@@ -50,6 +51,8 @@
 | `static/manifest.json`、`static/icons/` | 手機 App（PWA）設定與圖示（180 給 iOS、192／512 給 manifest） |
 | `tools/icon.html` | App 圖示原始檔；用 Edge 無頭模式截圖產生 PNG（做法寫在檔案開頭） |
 | `tools/test_server.py` | 用資料庫副本在 5001 跑的測試伺服器 |
+| `tools/backup.py` | 備份資料庫：SQLite `backup()` 線上備份（伺服器執行中也安全），存 `backups/ledger-日期時間.db`，保留最新 N 份 |
+| `deploy/raspberry-pi/` | `install.sh`（systemd 服務＋每日備份）、`update.sh`（備份 → git pull → 重開） |
 | `packaging/` | 打包成 Windows 安裝程式（PyInstaller，見「打包」） |
 | `data/ledger.db` | 資料（不進 git，第一次啟動自動建立） |
 
@@ -161,7 +164,7 @@
 - 貸款還款、利息、保費不能直接修改，要在該帳戶頁刪除後重記。
 - 股票已實現損益用移動平均成本（部分券商用先進先出，數字會略有不同）；沒有股利、除權息紀錄。
 - **隱私模式只是遮住畫面**，不是密碼保護。
-- **沒有自動備份**，也沒有登入功能（不能公開到網路）、沒有離線記帳。
+- 自動備份只有 Linux 的 systemd timer；Windows 要自己排程 `tools/backup.py`。沒有登入功能（不能公開到網路）、沒有離線記帳。
 - 中文股名只涵蓋上市、上櫃、興櫃；外國股票用 Yahoo 的英文名稱（可自行改名，不會被覆蓋）。
 
 ## Shell 注意事項（Windows）

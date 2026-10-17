@@ -5,6 +5,7 @@ data/
 *.db-wal
 *.db-shm
 CLAUDE.local.md
+backups/
 .claude/
 
 # 打包產物與建置環境
