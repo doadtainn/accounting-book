@@ -281,6 +281,15 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .autopays .w-day { width: 64px; display: inline-block; text-align: right; }
 .autopays .w-num { width: 110px; text-align: right; }
 .row-muted td { opacity: .5; }
+/* 股票交易 */
+.tag-buy { color: var(--stock-up); border-color: var(--stock-up); }
+.tag-sell { color: var(--stock-down); border-color: var(--stock-down); }
+.row-editing td { background: var(--surface-2); }
+.trade-list { min-width: 860px; }
+.trade-list th, .trade-list td:nth-child(3) { white-space: nowrap; }
+.trade-form .form-group { grid-template-columns: 90px 1fr; }
+.side-btn { cursor: pointer; min-width: 64px; justify-content: center; }
+.btn.static-type { cursor: default; filter: none; }
 /* 固定開銷總表：手機上橫向捲動，不要擠成一字一行 */
 .fixed-table { min-width: 780px; }
 .fixed-table th { white-space: nowrap; }

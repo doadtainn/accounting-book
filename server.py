@@ -153,6 +153,28 @@ HOLDINGS_SQL = """CREATE TABLE IF NOT EXISTS holdings (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 )"""
 
+# 股票交易：買進／賣出，錢從證券戶綁定的交割戶（bank_id，交易當時記下）進出，不算收入支出。
+# amount = 交割金額（買進：股數×價格＋手續費；賣出：股數×價格－手續費－證交稅）
+# cost_basis／realized 由 recalc_holding() 依日期重播計算（移動平均成本），不要手動改
+TRADES_SQL = """CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    holding_id INTEGER NOT NULL,
+    bank_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+    shares REAL NOT NULL CHECK (shares > 0),
+    price REAL NOT NULL CHECK (price >= 0),
+    fee REAL NOT NULL DEFAULT 0,
+    tax REAL NOT NULL DEFAULT 0,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    cost_basis REAL NOT NULL DEFAULT 0,
+    realized REAL NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)"""
+
 # 貸款設定：每筆貸款一列（account_id 就是貸款帳戶的 id）
 LOANS_SQL = """CREATE TABLE IF NOT EXISTS loans (
     account_id INTEGER PRIMARY KEY,
@@ -355,6 +377,12 @@ def init_db():
         conn.execute(AUTOPAYS_SQL)
         conn.execute(FIXED_COSTS_SQL)
         conn.execute(SNAPSHOTS_SQL)
+        conn.execute(TRADES_SQL)
+        holding_cols = {r["name"] for r in conn.execute("PRAGMA table_info(holdings)")}
+        if "base_shares" not in holding_cols:  # 期初持股（交易紀錄之前的部位），現有持股全部當期初
+            conn.execute("ALTER TABLE holdings ADD COLUMN base_shares REAL NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE holdings ADD COLUMN base_cost REAL NOT NULL DEFAULT 0")
+            conn.execute("UPDATE holdings SET base_shares = shares, base_cost = cost")
         currency_columns = {r["name"] for r in conn.execute("PRAGMA table_info(currencies)")}
         if "rate_time" not in currency_columns:  # 匯率從 Yahoo 更新的時間；空白代表手動輸入
             conn.execute("ALTER TABLE currencies ADD COLUMN rate_time TEXT NOT NULL DEFAULT ''")
@@ -428,6 +456,11 @@ def account_balance(conn, id_, code):
         "SELECT COALESCE(SUM(to_amount), 0) FROM entries WHERE type = 'transfer' AND to_account_id = ? AND to_currency = ?",
         (id_, code),
     ).fetchone()[0]
+    # 股票交割：買進扣款、賣出入帳
+    total += conn.execute(
+        "SELECT COALESCE(SUM(CASE side WHEN 'sell' THEN amount ELSE -amount END), 0) FROM trades "
+        "WHERE bank_id = ? AND currency = ?", (id_, code),
+    ).fetchone()[0]
     return total
 
 
@@ -475,6 +508,35 @@ def fetch_quote(symbol, currency):
             "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "",
         }
     return None
+
+
+def replay_holding(conn, holding_id, base_shares, base_cost, write=False):
+    """從期初持股依日期重播買賣，算出目前股數、成本，以及每筆賣出的成本與已實現損益（移動平均成本）。"""
+    shares, cost = base_shares, base_cost
+    for t in conn.execute("SELECT * FROM trades WHERE holding_id = ? ORDER BY date, id", (holding_id,)).fetchall():
+        if t["side"] == "buy":
+            shares += t["shares"]
+            cost += t["amount"]
+            continue
+        if t["shares"] > shares + 1e-9:
+            raise ValueError(f"{t['date']} 賣出 {t['shares']:g} 股，超過當時持有的 {shares:g} 股")
+        basis = cost * t["shares"] / shares if shares else 0
+        shares -= t["shares"]
+        cost -= basis
+        if write:
+            conn.execute("UPDATE trades SET cost_basis = ?, realized = ? WHERE id = ?",
+                         (round(basis, 4), round(t["amount"] - basis, 4), t["id"]))
+    if abs(shares) < 1e-9:
+        shares, cost = 0, 0
+    return shares, cost
+
+
+def recalc_holding(conn, holding_id):
+    """交易有變動後重算持股的股數、成本與每筆賣出的損益。"""
+    h = conn.execute("SELECT * FROM holdings WHERE id = ?", (holding_id,)).fetchone()
+    shares, cost = replay_holding(conn, holding_id, h["base_shares"], h["base_cost"], write=True)
+    conn.execute("UPDATE holdings SET shares = ?, cost = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                 (round(shares, 6), round(cost, 4), holding_id))
 
 
 def fetch_rate(code):
@@ -787,6 +849,10 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 rows = conn.execute("SELECT * FROM autopays ORDER BY sort, id").fetchall()
             return self._json([dict(r) for r in rows])
+        if url.path == "/api/trades":
+            with db() as conn:
+                rows = conn.execute("SELECT * FROM trades ORDER BY date DESC, id DESC").fetchall()
+            return self._json([dict(r) for r in rows])
         if url.path == "/api/settings":
             return self._json(get_settings())
         if url.path == "/api/snapshots":
@@ -825,6 +891,7 @@ class Handler(SimpleHTTPRequestHandler):
             ("holdings", "refresh"): self._refresh_prices,
             ("currencies",): self._create_currency,
             ("currencies", "refresh"): self._refresh_rates,
+            ("trades",): self._create_trade,
             ("autopays",): self._create_autopay,
             ("fixedcosts",): self._create_fixed_cost,
             ("snapshots",): lambda data: self._json(take_snapshot(auto=False), 201),  # 手動記錄今天
@@ -871,6 +938,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "policies": self._save_policy,
                 "autopays": self._update_autopay,
                 "fixedcosts": self._update_fixed_cost,
+                "entries": self._update_entry,
+                "trades": self._update_trade,
             }.get(parts[0])
             if handler:
                 return self._run(lambda: handler(int(parts[1]), self._read_json()))
@@ -896,11 +965,11 @@ class Handler(SimpleHTTPRequestHandler):
             if parts[0] == "accounts":
                 return self._run(self._delete_account, id_)
             if parts[0] == "holdings":
-                with db() as conn:
-                    conn.execute("DELETE FROM holdings WHERE id = ?", (id_,))
-                return self._json({"ok": True})
+                return self._run(self._delete_holding, id_)
             if parts[0] == "currencies":
                 return self._run(self._delete_currency, id_)
+            if parts[0] == "trades":
+                return self._run(self._delete_trade, id_)
             if parts[0] == "fixedcosts":
                 with db() as conn:
                     conn.execute("DELETE FROM fixed_costs WHERE id = ?", (id_,))
@@ -924,6 +993,41 @@ class Handler(SimpleHTTPRequestHandler):
 
     # ----- 交易 -----
     def _create_entry(self, e):
+        with db() as conn:
+            f = self._entry_fields(conn, e)
+            cur = conn.execute(
+                "INSERT INTO entries (date, type, category, subcategory, account_id, from_account_id, to_account_id, "
+                "amount, currency, to_currency, to_amount, loan_kind, loan_id, note) "
+                "VALUES (:date, :type, :category, :subcategory, :account_id, :from_account_id, :to_account_id, "
+                ":amount, :currency, :to_currency, :to_amount, :loan_kind, :loan_id, :note)", f)
+        self._json({"id": cur.lastrowid}, 201)
+
+    @staticmethod
+    def _entry_locked(conn, row):
+        """貸款還款、利息、保費這類系統拆分過的交易不能直接修改（改了本金利息會對不上）。"""
+        if row["loan_kind"]:
+            return True
+        if row["type"] == "transfer" and row["to_account_id"]:
+            kind = conn.execute("SELECT kind FROM accounts WHERE id = ?", (row["to_account_id"],)).fetchone()
+            return bool(kind) and kind["kind"] in ("loan", "insurance")
+        return False
+
+    def _update_entry(self, id_, e):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM entries WHERE id = ?", (id_,)).fetchone()
+            if not row:
+                raise ValueError("找不到這筆交易")
+            if self._entry_locked(conn, row):
+                raise ValueError("這筆是貸款還款或保費，請到該帳戶頁的還款／繳費紀錄刪除後重記")
+            f = self._entry_fields(conn, {**e, "type": row["type"]})
+            conn.execute(
+                "UPDATE entries SET date = :date, category = :category, subcategory = :subcategory, account_id = :account_id, "
+                "from_account_id = :from_account_id, to_account_id = :to_account_id, amount = :amount, currency = :currency, "
+                "to_currency = :to_currency, to_amount = :to_amount, loan_kind = :loan_kind, loan_id = :loan_id, note = :note "
+                "WHERE id = :id", {**f, "id": id_})
+        self._json({"ok": True})
+
+    def _entry_fields(self, conn, e):
         type_ = e["type"]
         if type_ not in TYPES:
             raise ValueError("類型錯誤")
@@ -932,37 +1036,35 @@ class Handler(SimpleHTTPRequestHandler):
         category = subcategory = ""
         account_id = from_id = to_id = to_currency = to_amount = loan_id = None
         loan_kind = ""
-        with db() as conn:
-            if type_ == "transfer":
-                from_id = self._account_id(conn, e.get("from_account_id"), "轉出帳戶")
-                to_id = self._account_id(conn, e.get("to_account_id"), "轉入帳戶")
-                if not from_id or not to_id:
-                    raise ValueError("轉帳需要選擇轉出帳戶與轉入帳戶")
-                to_currency = text(e.get("to_currency")) or currency
-                if from_id == to_id and currency == to_currency:
-                    raise ValueError("轉出與轉入不能是同一個帳戶的同一個幣別")
-                self._check_currency(conn, from_id, currency, "轉出帳戶")
-                self._check_currency(conn, to_id, to_currency, "轉入帳戶")
-                # 同幣別：轉入金額 = 轉出金額；跨幣別（換匯）：要填轉入金額
-                to_amount = amount if currency == to_currency else positive(e.get("to_amount") or 0, "轉入金額")
-                if e.get("loan_kind") == "extra":
-                    kind = conn.execute("SELECT kind FROM accounts WHERE id = ?", (to_id,)).fetchone()["kind"]
-                    if kind != "loan":
-                        raise ValueError("只有轉入貸款才能標記為額外還款")
-                    loan_kind, loan_id = "extra", to_id
-            else:
-                category = text(e.get("category")) or "其他雜項"
-                subcategory = text(e.get("subcategory"))
-                account_id = self._account_id(conn, e.get("account_id"), "帳戶")
-                self._check_currency(conn, account_id, currency, "帳戶")
-            cur = conn.execute(
-                "INSERT INTO entries (date, type, category, subcategory, account_id, from_account_id, to_account_id, "
-                "amount, currency, to_currency, to_amount, loan_kind, loan_id, note) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(e["date"])[:10], type_, category, subcategory, account_id, from_id, to_id,
-                 amount, currency, to_currency, to_amount, loan_kind, loan_id, text(e.get("note"))),
-            )
-        self._json({"id": cur.lastrowid}, 201)
+        date.fromisoformat(str(e["date"])[:10])  # 日期格式錯誤會丟 ValueError
+        if type_ == "transfer":
+            from_id = self._account_id(conn, e.get("from_account_id"), "轉出帳戶")
+            to_id = self._account_id(conn, e.get("to_account_id"), "轉入帳戶")
+            if not from_id or not to_id:
+                raise ValueError("轉帳需要選擇轉出帳戶與轉入帳戶")
+            to_currency = text(e.get("to_currency")) or currency
+            if from_id == to_id and currency == to_currency:
+                raise ValueError("轉出與轉入不能是同一個帳戶的同一個幣別")
+            self._check_currency(conn, from_id, currency, "轉出帳戶")
+            self._check_currency(conn, to_id, to_currency, "轉入帳戶")
+            # 同幣別：轉入金額 = 轉出金額；跨幣別（換匯）：要填轉入金額
+            to_amount = amount if currency == to_currency else positive(e.get("to_amount") or 0, "轉入金額")
+            if e.get("loan_kind") == "extra":
+                kind = conn.execute("SELECT kind FROM accounts WHERE id = ?", (to_id,)).fetchone()["kind"]
+                if kind != "loan":
+                    raise ValueError("只有轉入貸款才能標記為額外還款")
+                loan_kind, loan_id = "extra", to_id
+        else:
+            category = text(e.get("category")) or "其他雜項"
+            subcategory = text(e.get("subcategory"))
+            account_id = self._account_id(conn, e.get("account_id"), "帳戶")
+            self._check_currency(conn, account_id, currency, "帳戶")
+        return {
+            "date": str(e["date"])[:10], "type": type_, "category": category, "subcategory": subcategory,
+            "account_id": account_id, "from_account_id": from_id, "to_account_id": to_id, "amount": amount,
+            "currency": currency, "to_currency": to_currency, "to_amount": to_amount, "loan_kind": loan_kind,
+            "loan_id": loan_id, "note": text(e.get("note")),
+        }
 
     @staticmethod
     def _account_id(conn, value, label):
@@ -1058,6 +1160,9 @@ class Handler(SimpleHTTPRequestHandler):
             ).fetchone()[0]
             if used:
                 raise ValueError(f"這個帳戶還有 {used} 筆交易，請先刪除那些交易才能刪除帳戶")
+            traded = conn.execute("SELECT COUNT(*) FROM trades WHERE account_id = ? OR bank_id = ?", (id_, id_)).fetchone()[0]
+            if traded:
+                raise ValueError(f"這個帳戶還有 {traded} 筆股票交易，請先刪除那些交易才能刪除帳戶")
             held = conn.execute("SELECT COUNT(*) FROM holdings WHERE account_id = ?", (id_,)).fetchone()[0]
             if held:
                 raise ValueError(f"這個帳戶還有 {held} 檔持股，請先刪除持股才能刪除帳戶")
@@ -1533,9 +1638,10 @@ class Handler(SimpleHTTPRequestHandler):
             self._check_currency(conn, None, currency, "")
             sort = conn.execute("SELECT COALESCE(MAX(sort), 0) + 1 FROM holdings").fetchone()[0]
             cur = conn.execute(
-                "INSERT INTO holdings (account_id, symbol, name, shares, cost, price, currency, price_time, sort) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (int(h["account_id"]), symbol, name, n["shares"], n["cost"], n["price"], currency, price_time, sort),
+                "INSERT INTO holdings (account_id, symbol, name, shares, cost, price, currency, price_time, sort, base_shares, base_cost) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(h["account_id"]), symbol, name, n["shares"], n["cost"], n["price"], currency, price_time, sort,
+                 n["shares"], n["cost"]),
             )
         self._json({"id": cur.lastrowid, "warning": warning}, 201)
 
@@ -1550,12 +1656,145 @@ class Handler(SimpleHTTPRequestHandler):
             if not row:
                 raise ValueError("持股不存在")
             symbol, name, n = self._holding_fields({**dict(row), **h})
+            base_shares, base_cost = self._holding_base(conn, row, n)
             conn.execute(
                 "UPDATE holdings SET symbol = ?, name = ?, shares = ?, cost = ?, price = ?, price_time = ?, delisted = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "base_shares = ?, base_cost = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (symbol, name, n["shares"], n["cost"], n["price"],
-                 "" if "price" in h else row["price_time"], 1 if h.get("delisted", row["delisted"]) else 0, id_),
+                 "" if "price" in h else row["price_time"], 1 if h.get("delisted", row["delisted"]) else 0,
+                 base_shares, base_cost, id_),
             )
+            recalc_holding(conn, id_)
+        self._json({"ok": True})
+
+    def _delete_holding(self, id_):
+        with db() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM trades WHERE holding_id = ?", (id_,)).fetchone()[0]
+            if n:
+                raise ValueError(f"這檔股票還有 {n} 筆交易紀錄，請先刪除交易才能刪除持股")
+            conn.execute("DELETE FROM holdings WHERE id = ?", (id_,))
+        self._json({"ok": True})
+
+    @staticmethod
+    def _holding_base(conn, row, n):
+        """手動改股數、成本：沒有交易就直接當期初；有交易時回推期初，讓「期初＋交易」剛好等於輸入的值。"""
+        trades = conn.execute("SELECT side, shares FROM trades WHERE holding_id = ?", (row["id"],)).fetchall()
+        if not trades:
+            return n["shares"], n["cost"]
+        net = sum(t["shares"] if t["side"] == "buy" else -t["shares"] for t in trades)
+        base_shares = n["shares"] - net
+        if base_shares < -1e-9:
+            raise ValueError("股數比交易紀錄算出來的還少，請改交易紀錄")
+        base_shares = max(0, base_shares)
+        c0 = replay_holding(conn, row["id"], base_shares, 0)[1]
+        if base_shares < 1e-9:  # 沒有期初部位：成本完全由交易決定
+            if abs(n["cost"] - c0) > 0.01:
+                raise ValueError("這檔的成本完全來自交易紀錄，要調整請修改交易")
+            return 0, 0
+        # 成本對期初成本是線性的：重播兩次（期初成本 0 和 1）求斜率
+        c0 = replay_holding(conn, row["id"], base_shares, 0)[1]
+        c1 = replay_holding(conn, row["id"], base_shares, 1)[1]
+        k = c1 - c0
+        if abs(k) < 1e-12:
+            if abs(n["cost"] - c0) > 0.01:
+                raise ValueError("期初持股已全部賣出，成本由交易紀錄決定，請改交易紀錄")
+            return base_shares, row["base_cost"]
+        base_cost = (n["cost"] - c0) / k
+        if base_cost < -0.01:
+            raise ValueError("成本比交易紀錄算出來的還低，請改交易紀錄")
+        return base_shares, max(0, base_cost)
+
+    # ----- 股票交易 -----
+    def _trade_fields(self, conn, t, account_id=None):
+        account_id = int(account_id or t.get("account_id") or 0)
+        account = conn.execute("SELECT kind FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if not account or account["kind"] != "securities":
+            raise ValueError("股票交易只能記在證券戶")
+        bank = conn.execute("SELECT id, name FROM accounts WHERE kind = 'bank' AND settlement_for = ?", (account_id,)).fetchone()
+        if not bank:
+            raise ValueError("這個證券戶還沒有綁定交割戶，請先到銀行帳戶頁的「證券交割戶」設定")
+        side = t.get("side")
+        if side not in ("buy", "sell"):
+            raise ValueError("請選擇買進或賣出")
+        when = text(t.get("date"))[:10]
+        date.fromisoformat(when)
+        shares = positive(t.get("shares") or 0, "股數")
+        price = float(t.get("price") or 0)
+        fee, tax = float(t.get("fee") or 0), float(t.get("tax") or 0) if side == "sell" else 0
+        if price <= 0:
+            raise ValueError("價格必須大於 0")
+        if fee < 0 or tax < 0:
+            raise ValueError("手續費、證交稅不能是負數")
+        gross = shares * price
+        amount = gross + fee if side == "buy" else gross - fee - tax
+        if amount <= 0:
+            raise ValueError("手續費與稅比成交金額還高，請確認金額")
+        return {"account_id": account_id, "bank_id": bank["id"], "bank_name": bank["name"], "side": side, "date": when,
+                "shares": shares, "price": price, "fee": round(fee, 4), "tax": round(tax, 4),
+                "amount": round(amount, 4), "note": text(t.get("note"))}
+
+    def _trade_holding(self, conn, t, f):
+        """交易對應的持股：選現有的（holding_id），或新股票（symbol＋currency），買進時自動建立持股。"""
+        if t.get("holding_id"):
+            h = conn.execute("SELECT * FROM holdings WHERE id = ? AND account_id = ?",
+                             (int(t["holding_id"]), f["account_id"])).fetchone()
+            if not h:
+                raise ValueError("找不到這檔持股")
+            return h
+        symbol = text(t.get("symbol")).upper()
+        if not symbol:
+            raise ValueError("請選擇股票或輸入代號")
+        currency = text(t.get("currency")) or BASE_CURRENCY
+        h = conn.execute("SELECT * FROM holdings WHERE account_id = ? AND symbol = ? AND currency = ?",
+                         (f["account_id"], symbol, currency)).fetchone()
+        if h:
+            return h
+        if f["side"] == "sell":
+            raise ValueError(f"這個證券戶沒有 {symbol}，不能賣出")
+        self._check_currency(conn, None, currency, "")
+        name = holding_name("", symbol, currency) or text(t.get("name"))
+        quote = None if name and currency == BASE_CURRENCY else fetch_quote(symbol, currency)
+        sort = conn.execute("SELECT COALESCE(MAX(sort), 0) + 1 FROM holdings").fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO holdings (account_id, symbol, name, shares, cost, price, currency, price_time, sort, base_shares, base_cost) "
+            "VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 0, 0)",
+            (f["account_id"], symbol, name or (quote["name"] if quote else ""),
+             quote["price"] if quote else f["price"], currency, quote["time"] if quote else "", sort))
+        return conn.execute("SELECT * FROM holdings WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+    def _create_trade(self, t):
+        with db() as conn:
+            f = self._trade_fields(conn, t)
+            h = self._trade_holding(conn, t, f)
+            self._check_currency(conn, f["bank_id"], h["currency"], f"交割戶「{f['bank_name']}」")
+            cur = conn.execute(
+                "INSERT INTO trades (account_id, holding_id, bank_id, date, side, shares, price, fee, tax, amount, currency, note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f["account_id"], h["id"], f["bank_id"], f["date"], f["side"], f["shares"], f["price"], f["fee"],
+                 f["tax"], f["amount"], h["currency"], f["note"]))
+            recalc_holding(conn, h["id"])  # 賣超過持股會丟錯，整筆不寫入
+            row = conn.execute("SELECT * FROM trades WHERE id = ?", (cur.lastrowid,)).fetchone()
+        self._json(dict(row), 201)
+
+    def _update_trade(self, id_, t):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM trades WHERE id = ?", (id_,)).fetchone()
+            if not row:
+                raise ValueError("找不到這筆股票交易")
+            f = self._trade_fields(conn, {**dict(row), **t}, row["account_id"])
+            conn.execute(
+                "UPDATE trades SET date = ?, side = ?, shares = ?, price = ?, fee = ?, tax = ?, amount = ?, note = ? WHERE id = ?",
+                (f["date"], f["side"], f["shares"], f["price"], f["fee"], f["tax"], f["amount"], f["note"], id_))
+            recalc_holding(conn, row["holding_id"])
+        self._json({"ok": True})
+
+    def _delete_trade(self, id_):
+        with db() as conn:
+            row = conn.execute("SELECT holding_id FROM trades WHERE id = ?", (id_,)).fetchone()
+            if not row:
+                raise ValueError("找不到這筆股票交易")
+            conn.execute("DELETE FROM trades WHERE id = ?", (id_,))
+            recalc_holding(conn, row["holding_id"])  # 刪掉買進後若之後的賣出不夠賣，會丟錯並還原
         self._json({"ok": True})
 
     # ----- 幣別 -----

@@ -74,6 +74,7 @@ const ICONS = {
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
   sliders: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
   refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
@@ -101,7 +102,7 @@ const shiftMonth = (m, delta) => {
 };
 
 // ===== 資料 =====
-const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], snapshots: [], settings: {}, month: today().slice(0, 7), flash: null };
+const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], snapshots: [], settings: {}, trades: [], month: today().slice(0, 7), flash: null };
 // 隱私模式：金額顯示成 *****；開關記在這台裝置（手機設了不影響電腦）
 const MASK = "*****";
 state.privacy = (() => {
@@ -259,9 +260,12 @@ function accountEffects(r, id) {
   const codes = new Set([r.currency, r.to_currency].filter(Boolean));
   return [...codes].map((code) => ({ code, delta: accountDelta(r, id, code) })).filter((e) => e.delta !== 0);
 }
+// 股票交割對交割戶的影響：買進扣款、賣出入帳
+const tradeDelta = (t, id, code) => (t.bank_id === id && t.currency === code ? (t.side === "sell" ? t.amount : -t.amount) : 0);
 function balance(id, code) {
   const initial = findAccount(id)?.currencies.find((h) => h.currency === code)?.initial_balance ?? 0;
-  return state.entries.reduce((b, r) => b + accountDelta(r, id, code), initial);
+  const cash = state.entries.reduce((b, r) => b + accountDelta(r, id, code), initial);
+  return state.trades.reduce((b, t) => b + tradeDelta(t, id, code), cash);
 }
 // 帳戶所有幣別換算成台幣的總額
 function balanceBase(id) {
@@ -316,7 +320,7 @@ async function api(path, opts = {}) {
   return data;
 }
 async function reload() {
-  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings] = await Promise.all([
+  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades] = await Promise.all([
     api("/api/entries?month="),
     api("/api/categories"),
     api("/api/accounts"),
@@ -328,6 +332,7 @@ async function reload() {
     api("/api/fixedcosts"),
     api("/api/snapshots"),
     api("/api/settings"),
+    api("/api/trades"),
   ]);
   tzOffset = Number(state.settings.tz_offset);
 }
@@ -407,6 +412,12 @@ function accountCell(r) {
   return esc(accountName(r.account_id)) || `<span class="muted">—</span>`;
 }
 
+// 貸款還款、利息、保費是系統拆分過的，不能直接修改（和伺服器 _entry_locked 同一套規則）
+function entryLocked(r) {
+  if (r.loan_kind) return true;
+  return r.type === "transfer" && ["loan", "insurance"].includes(findAccount(r.to_account_id)?.kind);
+}
+
 // accountId 有值時，金額改成相對該帳戶的流入/流出（各幣別分開列）
 function txTable(rows, { deletable = true, accountId = null, showDate = true } = {}) {
   if (!rows.length) return `<p class="empty">沒有交易紀錄</p>`;
@@ -420,7 +431,10 @@ function txTable(rows, { deletable = true, accountId = null, showDate = true } =
       <td class="text-right">${accountId
         ? accountEffects(r, accountId).map((e) => signedAmount(e.delta, e.code)).join("<br>")
         : entryAmount(r)}</td>
-      ${deletable ? `<td class="text-right"><button class="btn btn-xs btn-default" data-del="${r.id}" title="刪除">${icon("trash")}</button></td>` : ""}
+      ${deletable ? `<td class="text-right nowrap">${entryLocked(r)
+        ? `<span class="muted" title="貸款還款、保費請到該帳戶頁的還款／繳費紀錄處理">${icon("lock")}</span>`
+        : `<button class="btn btn-xs btn-default" data-edit="${r.id}" title="修改">${icon("edit")}</button>`}
+        <button class="btn btn-xs btn-default" data-del="${r.id}" title="刪除">${icon("trash")}</button></td>` : ""}
     </tr>`).join("")}</tbody>
   </table></div>`;
 }
@@ -454,9 +468,9 @@ function makeSortable(el, url, options = {}) {
 }
 
 // 帳戶下拉選單的選項，依種類分組
-function accountOptions(selectedId) {
+function accountOptions(selectedId, { cashOnly = false } = {}) {
   return Object.entries(ACCOUNT_KINDS).map(([kind, k]) => {
-    const list = accountsOf(kind);
+    const list = accountsOf(kind).filter((a) => !cashOnly || kind !== "securities" || a.id === Number(selectedId));
     if (!list.length) return "";
     return `<optgroup label="${k.name}">${list.map((a) =>
       `<option value="${a.id}"${a.id === selectedId ? " selected" : ""}>${esc(a.name)}</option>`
@@ -1073,10 +1087,27 @@ function newPage(arg, arg2) {
   return { title: "新增交易", sub: TYPES[type].name, crumbs: ["首頁", "新增交易"], ...form };
 }
 
+// 修改交易：#/edit/<id>，表單和新增共用，存完回到原本的頁面（state.returnTo）
+function editPage(arg) {
+  const entry = state.entries.find((r) => r.id === Number(arg));
+  const page = { title: "修改交易", crumbs: ["首頁", "修改交易"] };
+  if (!entry) return { ...page, html: `<p class="empty">找不到這筆交易（可能已刪除）</p>` };
+  if (entryLocked(entry)) {
+    return { ...page, html: box("無法直接修改", `<p>這筆是貸款還款、利息或保費，本金與利息是系統拆分的。請到
+      <a href="#/account/${entry.to_account_id ?? entry.loan_id}">該帳戶頁</a>的還款／繳費紀錄刪除後重記。</p>`, { cls: "box-warning" }) };
+  }
+  return { ...page, sub: TYPES[entry.type].name, ...txForm(entry.type, null, { entry }) };
+}
+
 // 新增交易表單（新增交易頁與行事曆共用）。embedded：嵌在行事曆裡，類型用按鈕切換、存完留在行事曆
-function txForm(type, preset, { date = today(), embedded = false } = {}) {
+function txForm(type, preset, { date = today(), embedded = false, entry = null } = {}) {
   const t = TYPES[type];
-  preset = findAccount(preset)?.id ?? null;
+  const editing = Boolean(entry);
+  const entry_ = entry; // submit 裡的 entry 是要送出的資料，原本那筆用 entry_
+  if (editing) date = entry.date;
+  // 證券戶只做股票交易，記帳表單不預選證券戶
+  preset = findAccount(preset)?.kind === "securities" ? null : findAccount(preset)?.id ?? null;
+  const cashAccounts = state.accounts.filter((a) => a.kind !== "securities");
   const mains = mainCategories(type);
   const noAccount = (msg) => `<div class="form-group"><label>帳戶</label>
     <span class="muted">${msg}，請先到 <a href="#/accounts">帳戶管理</a> 新增</span></div>`;
@@ -1084,23 +1115,25 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
   const accountRow = (label, id, selected) => `
     <div class="form-group"><label for="${id}">${label}</label>
       <div class="input-row">
-        <select class="form-control" id="${id}">${accountOptions(selected)}</select>
+        <select class="form-control" id="${id}">${accountOptions(selected, { cashOnly: true })}</select>
         <select class="form-control cur-select" id="${id}-cur" aria-label="${label}幣別"></select>
       </div>
     </div>`;
 
-  const typeButtons = Object.entries(TYPES).map(([k, v]) => embedded
+  const typeButtons = editing
+    ? `<span class="btn ${t.btn} static-type">${icon(t.icon)} ${t.name}</span>`
+    : Object.entries(TYPES).map(([k, v]) => embedded
     ? `<button type="button" class="btn ${k === type ? v.btn : "btn-default"}" data-cal-type="${k}">${icon(v.icon)} ${v.name}</button>`
     : `<a class="btn ${k === type ? v.btn : "btn-default"}" href="#/new/${k}${preset ? "/" + preset : ""}">${icon(v.icon)} ${v.name}</a>`
   ).join("");
 
   let fields = "";
   if (type === "transfer") {
-    if (!state.accounts.length) {
+    if (!cashAccounts.length) {
       fields = noAccount("還沒有帳戶");
     } else {
-      const from = preset ?? state.accounts[0].id;
-      const to = (state.accounts.find((a) => a.id !== from) ?? state.accounts[0]).id;
+      const from = editing ? entry.from_account_id : preset ?? cashAccounts[0].id;
+      const to = editing ? entry.to_account_id : (cashAccounts.find((a) => a.id !== from) ?? cashAccounts[0]).id;
       fields = accountRow("轉出帳戶", "f-from", from) + accountRow("轉入帳戶", "f-to", to);
     }
   } else {
@@ -1114,16 +1147,18 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
       : `<div class="form-group"><label>分類</label>
           <span class="muted">還沒有${t.name}分類，請先到 <a href="#/settings/${type}">分類設定</a> 新增</span>
         </div>`;
-    fields += state.accounts.length ? accountRow("帳戶", "f-account", preset ?? state.accounts[0].id) : noAccount("還沒有帳戶");
+    fields += cashAccounts.length
+      ? accountRow("帳戶", "f-account", editing ? entry.account_id : preset ?? cashAccounts[0].id)
+      : noAccount("還沒有帳戶");
   }
 
   return {
-    html: `<form id="txForm" autocomplete="off">${box(embedded ? `新增${t.name}` : "交易資訊", `
+    html: `<form id="txForm" autocomplete="off">${box(editing ? `修改${t.name}` : embedded ? `新增${t.name}` : "交易資訊", `
       <div class="form-group"><label>類型</label><div class="btn-group">${typeButtons}</div></div>
       ${fields}
       <div class="form-group"><label for="f-amount">${type === "transfer" ? "轉出金額" : "金額"}</label>
         <div class="input-group"><span class="input-group-addon" id="f-sym">${symbol(BASE)}</span>
-          <input class="form-control" id="f-amount" type="number" min="0.01" step="0.01" inputmode="decimal" required>
+          <input class="form-control" id="f-amount" type="number" min="0.01" step="0.01" inputmode="decimal" required value="${editing ? entry.amount : ""}">
         </div>
       </div>
       <div class="form-group" id="g-to-amount" hidden><label for="f-to-amount">轉入金額</label>
@@ -1141,13 +1176,14 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
         <input class="form-control" id="f-date" type="date" value="${date}" required>
       </div>
       <div class="form-group"><label for="f-note">描述</label>
-        <input class="form-control" id="f-note" placeholder="選填，例如：午餐便當">
+        <input class="form-control" id="f-note" placeholder="選填，例如：午餐便當" value="${editing ? esc(entry.note) : ""}">
       </div>`, {
       cls: t.box,
       footer: `<div class="box-footer-row">
-        ${embedded ? `<span class="muted">點上面的日期可換日期</span>`
+        ${editing ? `<a class="btn btn-default" href="${esc(state.returnTo || `#/${type}`)}">取消</a>`
+          : embedded ? `<span class="muted">點上面的日期可換日期</span>`
           : `<label class="checkbox"><input type="checkbox" id="f-stay" checked> 儲存後留在此頁繼續新增</label>`}
-        <button class="btn ${t.btn}" type="submit">儲存${t.name}</button>
+        <button class="btn ${t.btn}" type="submit">${editing ? "儲存修改" : `儲存${t.name}`}</button>
       </div>`,
     })}</form>`,
     after() {
@@ -1160,7 +1196,29 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
             : `<option value="">（無子分類）</option>`;
         };
         catSelect.addEventListener("change", fillSubs);
+        if (editing) {
+          const opt = [...catSelect.options].find((o) => o.text === entry.category);
+          if (opt) catSelect.value = opt.value;
+          else { catSelect.insertAdjacentHTML("beforeend", `<option value="">${esc(entry.category)}</option>`); catSelect.value = ""; }
+        }
         fillSubs();
+        if (editing) {
+          const sub = $("#f-sub");
+          if (![...sub.options].some((o) => o.value === entry.subcategory)) {
+            sub.insertAdjacentHTML("beforeend", `<option value="${esc(entry.subcategory)}">${esc(entry.subcategory || "（無子分類）")}</option>`);
+          }
+          sub.value = entry.subcategory;
+        }
+      }
+      if (editing) {
+        // 先放入原本的幣別，下面 fill() 會保留它
+        const preCur = { "#f-account-cur": entry.currency, "#f-from-cur": entry.currency, "#f-to-cur": entry.to_currency ?? entry.currency };
+        Object.entries(preCur).forEach(([sel, code]) => { if ($(sel)) $(sel).innerHTML = `<option value="${esc(code)}">${esc(code)}</option>`; });
+        if (entry.to_amount != null && entry.to_currency !== entry.currency) {
+          $("#f-to-amount").value = entry.to_amount;
+          $("#f-to-amount").dataset.touched = "1";
+        }
+        if (entry.loan_kind === "extra") $("#f-extra").checked = true;
       }
 
       // 幣別：帳戶換了就重填幣別選項；金額前綴跟著幣別；跨幣別轉帳顯示「轉入金額」
@@ -1225,6 +1283,15 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
           }
         }
         try {
+          if (editing) {
+            await putJson(`/api/entries/${entry_.id}`, entry);
+            state.flash = ["success", `已修改${t.name}：${label} ${money(Number(entry.amount), entry.currency)}`];
+            state.month = entry.date.slice(0, 7);
+            state.calDay = entry.date;
+            await reload();
+            location.hash = state.returnTo || `#/${type}`;
+            return;
+          }
           await api("/api/entries", { method: "POST", body: JSON.stringify(entry) });
           await reload();
           const msg = `已新增${t.name}：${label} ${money(Number(entry.amount), entry.currency)}`;
@@ -1249,7 +1316,7 @@ function txForm(type, preset, { date = today(), embedded = false } = {}) {
             location.hash = preset ? `#/account/${preset}` : `#/${type}`;
           }
         } catch (err) {
-          showAlert("danger", "新增失敗：" + err.message);
+          showAlert("danger", (editing ? "修改失敗：" : "新增失敗：") + err.message);
         } finally {
           btn.disabled = false;
         }
@@ -1322,8 +1389,161 @@ function holdingsBox(a) {
       <select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, accountCodes(a)[0] ?? BASE)}</select>
       <button class="btn btn-default" type="submit">${icon("plus")} 新增持股</button>
     </form>
-    <p class="muted hint">代號依幣別判斷市場：台幣填 2330（上市上櫃自動判斷）、美金填 AAPL、港幣填 700、日幣填 7203；也可直接填 Yahoo 代號如 0700.HK。購買成本＝總成本（含手續費）。表格內數字改完自動儲存，拖曳 ⠿ 排序。</p>`,
+    <p class="muted hint">代號依幣別判斷市場：台幣填 2330（上市上櫃自動判斷）、美金填 AAPL、港幣填 700、日幣填 7203；也可直接填 Yahoo 代號如 0700.HK。購買成本＝總成本（含手續費）。表格內數字改完自動儲存，拖曳 ⠿ 排序。有股票交易紀錄的股票，股數與成本由交易自動計算；手動修改會調整交易之前的期初持股。</p>`,
   });
+}
+
+// ===== 股票交易（證券戶）：買進／賣出、已實現損益；錢從綁定的交割戶進出 =====
+const SIDES = { buy: { name: "買進", cls: "tag-buy" }, sell: { name: "賣出", cls: "tag-sell" } };
+const tradesOf = (accountId) => state.trades.filter((t) => t.account_id === accountId);
+const shareText = (n) => (state.privacy ? MASK : Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 4 }));
+const holdingLabel = (h) => (h ? `${h.symbol} ${h.name}`.trim() : "（已刪除的股票）");
+// 台股手續費 0.1425%（最低 20 元）、賣出證交稅 0.3%；其他市場預設 0，可自行修改
+function estimateCosts(side, gross, code) {
+  if (code !== BASE || !gross) return { fee: 0, tax: 0 };
+  return { fee: Math.max(20, Math.floor(gross * 0.001425)), tax: side === "sell" ? Math.floor(gross * 0.003) : 0 };
+}
+const realizedBase = (list) => list.filter((t) => t.side === "sell").reduce((s, t) => s + toBase(t.realized, t.currency), 0);
+
+function tradeSection(a, bank) {
+  if (!bank) {
+    const banks = accountsOf("bank");
+    return box(`${icon("transfer")} 股票交易`, `<p class="empty">要記錄股票買賣，請先綁定交割戶：到銀行帳戶頁的「證券交割戶」選擇「${esc(a.name)}」。</p>
+      ${banks.length ? `<p class="text-center">${banks.map((b) => `<a class="btn btn-sm btn-default" href="#/account/${b.id}">${esc(b.name)}</a>`).join(" ")}</p>` : ""}`,
+      { cls: "box-warning" });
+  }
+  const trades = tradesOf(a.id);
+  const year = state.tradeYear ?? state.month.slice(0, 4);
+  const yearTrades = trades.filter((t) => t.date.startsWith(year));
+  const holdings = holdingsOf(a.id);
+  const editing = trades.find((t) => t.id === state.editTrade);
+  const v = editing ?? { side: "buy", date: today(), shares: "", price: "", fee: "", tax: "", note: "" };
+  const hasCost = (k) => editing && v[k] !== "" ? ` data-touched="1"` : "";
+
+  // 每月已實現損益（台幣）
+  const months = Array.from({ length: 12 }, (_, i) => `${year}-${pad2(i + 1)}`).map((m) => {
+    const list = yearTrades.filter((t) => t.date.startsWith(m));
+    const sum = (side) => list.filter((t) => t.side === side).reduce((s, t) => s + toBase(t.amount, t.currency), 0);
+    return { m, count: list.length, buy: sum("buy"), sell: sum("sell"), realized: realizedBase(list) };
+  });
+  const monthTable = `<div class="table-wrap"><table class="table table-hover trade-months">
+      <thead><tr><th>月份</th><th class="text-right">筆數</th><th class="text-right">買進金額</th><th class="text-right">賣出金額</th><th class="text-right">已實現損益</th></tr></thead>
+      <tbody>${months.map((r) => `<tr class="${r.count ? "" : "row-muted"}">
+        <td>${Number(r.m.slice(5))} 月</td><td class="text-right">${r.count || "—"}</td>
+        <td class="text-right amount">${r.buy ? money(Math.round(r.buy)) : "—"}</td>
+        <td class="text-right amount">${r.sell ? money(Math.round(r.sell)) : "—"}</td>
+        <td class="text-right">${r.realized ? plText(Math.round(r.realized)) : "—"}</td></tr>`).join("")}</tbody>
+      <tfoot><tr><td><strong>${year} 年合計</strong></td><td class="text-right">${yearTrades.length}</td>
+        <td class="text-right amount">${money(Math.round(months.reduce((s, r) => s + r.buy, 0)))}</td>
+        <td class="text-right amount">${money(Math.round(months.reduce((s, r) => s + r.sell, 0)))}</td>
+        <td class="text-right"><strong>${plText(Math.round(realizedBase(yearTrades)))}</strong></td></tr></tfoot>
+    </table></div>`;
+
+  const list = yearTrades.length
+    ? `<div class="table-wrap"><table class="table table-hover trade-list">
+        <thead><tr><th>日期</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">成交價</th>
+          <th class="text-right">手續費＋稅</th><th class="text-right">交割金額</th><th class="text-right">已實現損益</th><th>備註</th><th></th></tr></thead>
+        <tbody>${yearTrades.map((t) => {
+          const h = state.holdings.find((x) => x.id === t.holding_id);
+          return `<tr class="${t.id === state.editTrade ? "row-editing" : ""}">
+            <td class="nowrap">${t.date}</td>
+            <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
+            <td>${esc(holdingLabel(h))}</td>
+            <td class="text-right">${shareText(t.shares)}</td>
+            <td class="text-right amount">${money(t.price, t.currency)}</td>
+            <td class="text-right amount muted">${money(t.fee + t.tax, t.currency)}</td>
+            <td class="text-right">${signedAmount(t.side === "sell" ? t.amount : -t.amount, t.currency)}</td>
+            <td class="text-right">${t.side === "sell" ? plText(t.realized, t.currency) : `<span class="muted">—</span>`}</td>
+            <td class="muted">${esc(t.note) || "—"}</td>
+            <td class="text-right nowrap">
+              <button class="btn btn-xs btn-default" data-trade-edit="${t.id}" title="修改">${icon("edit")}</button>
+              <button class="btn btn-xs btn-default" data-trade-del="${t.id}" title="刪除">${icon("trash")}</button>
+            </td></tr>`;
+        }).join("")}</tbody>
+      </table></div>`
+    : `<p class="empty">${year} 年沒有股票交易</p>`;
+
+  const codes = accountCodes(bank);
+  const holdingOptions = holdings.map((h) => `<option value="${h.id}" data-currency="${esc(h.currency)}"${editing && editing.holding_id === h.id ? " selected" : ""}>
+    ${esc(holdingLabel(h))}（持有 ${shareText(h.shares)} 股）</option>`).join("");
+  const form = `<form class="trade-form" data-trade-form="${a.id}" autocomplete="off">
+      <div class="form-group"><label>買賣</label><div class="btn-group" role="radiogroup">
+        ${Object.entries(SIDES).map(([k, s]) => `<label class="btn btn-sm ${v.side === k ? (k === "buy" ? "btn-danger" : "btn-success") : "btn-default"} side-btn">
+          <input type="radio" name="side" value="${k}"${v.side === k ? " checked" : ""} hidden>${s.name}</label>`).join("")}
+      </div></div>
+      <div class="form-group"><label for="tr-holding">股票</label><div class="input-row">
+        <select class="form-control" id="tr-holding" name="holding_id"${editing ? " disabled" : ""}>${holdingOptions}
+          ${editing ? "" : `<option value="">＋ 其他股票（輸入代號）</option>`}</select>
+      </div></div>
+      <div class="form-group" id="tr-new"${holdings.length || editing ? " hidden" : ""}><label for="tr-symbol">代號</label><div class="input-row">
+        <input class="form-control" id="tr-symbol" name="symbol" placeholder="代號，例如 2330">
+        <select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, codes[0] ?? BASE)}</select>
+      </div></div>
+      <div class="form-group"><label for="tr-date">日期</label><input class="form-control" id="tr-date" name="date" type="date" value="${esc(v.date)}" required></div>
+      <div class="form-group"><label for="tr-shares">股數</label><input class="form-control" id="tr-shares" name="shares" type="number" min="0" step="any" inputmode="decimal" value="${v.shares}" required placeholder="一張 = 1000 股"></div>
+      <div class="form-group"><label for="tr-price">成交價</label><input class="form-control" id="tr-price" name="price" type="number" min="0" step="any" inputmode="decimal" value="${v.price}" required></div>
+      <div class="form-group"><label for="tr-fee">手續費</label><input class="form-control" id="tr-fee" name="fee" type="number" min="0" step="any" inputmode="decimal" value="${v.fee}"${hasCost("fee")}></div>
+      <div class="form-group" id="tr-tax-row"${v.side === "sell" ? "" : " hidden"}><label for="tr-tax">證交稅</label><input class="form-control" id="tr-tax" name="tax" type="number" min="0" step="any" inputmode="decimal" value="${v.tax}"${hasCost("tax")}></div>
+      <div class="form-group"><label>交割金額</label><div><strong id="tr-amount">—</strong>
+        <p class="muted hint">台股自動估算手續費 0.1425%（最低 20 元）與證交稅 0.3%（ETF 是 0.1%），請改成券商實際收的金額。</p></div></div>
+      <div class="form-group"><label for="tr-note">備註</label><input class="form-control" id="tr-note" name="note" value="${esc(v.note)}" placeholder="選填"></div>
+      <div class="box-footer-row">
+        <span class="muted">交割戶：<a href="#/account/${bank.id}">${esc(bank.name)}</a>（買進扣款、賣出入帳）</span>
+        <span>${editing ? `<button class="btn btn-default" type="button" data-trade-cancel>取消</button> ` : ""}
+        <button class="btn btn-primary" type="submit">${editing ? "儲存修改" : "記錄交易"}</button></span>
+      </div>
+    </form>`;
+
+  const yearNav = `<div class="btn-group">
+      <button class="btn btn-default btn-sm" data-trade-year="-1" aria-label="前一年">‹</button>
+      <span class="btn btn-default btn-sm static">${year} 年</span>
+      <button class="btn btn-default btn-sm" data-trade-year="1" aria-label="後一年">›</button></div>`;
+  return `
+    <div class="grid grid-3">
+      ${infoBox("aqua", "calendar", `${monthLabel(state.month)}已實現損益`, plText(Math.round(realizedBase(trades.filter((t) => t.date.startsWith(state.month))))), "換算台幣")}
+      ${infoBox("yellow", "chart", `${state.month.slice(0, 4)} 年已實現損益`, plText(Math.round(realizedBase(trades.filter((t) => t.date.startsWith(state.month.slice(0, 4)))))), "換算台幣")}
+      ${infoBox("purple", "scale", "累計已實現損益", plText(Math.round(realizedBase(trades))), `${trades.filter((t) => t.side === "sell").length} 筆賣出`)}
+    </div>
+    <div class="grid grid-2">
+      ${box(`${icon(editing ? "edit" : "plus")} ${editing ? "修改股票交易" : "記錄股票交易"}`, form, { cls: editing ? "box-warning" : "box-primary" })}
+      ${box(`${icon("chart")} 每月已實現損益`, monthTable, { cls: "box-default", flush: true, tools: yearNav,
+        footer: `<span class="muted hint-inline">已實現損益＝賣出交割金額－賣出股數的平均成本（移動平均，含買進手續費）；外幣換算台幣</span>` })}
+    </div>
+    ${box(`${icon("list")} 股票交易紀錄 <small class="muted">${year} 年</small>`, list, { cls: "box-default", flush: true, tools: yearNav })}`;
+}
+
+// 交易表單：切換買賣、股票，輸入股數價格時自動估算手續費、稅與交割金額
+function bindTradeForm() {
+  const form = $("[data-trade-form]");
+  if (!form) return;
+  const f = form.elements;
+  const codeOf = () => (f.holding_id.value ? f.holding_id.selectedOptions[0].dataset.currency : f.currency.value);
+  const side = () => form.querySelector('input[name="side"]:checked').value;
+  const update = () => {
+    const s = side();
+    form.querySelectorAll(".side-btn").forEach((b) => {
+      const on = b.querySelector("input").checked;
+      b.className = `btn btn-sm side-btn ${on ? (b.querySelector("input").value === "buy" ? "btn-danger" : "btn-success") : "btn-default"}`;
+    });
+    $("#tr-new").hidden = Boolean(f.holding_id.value) || f.holding_id.disabled;
+    f.symbol.required = !$("#tr-new").hidden;
+    $("#tr-tax-row").hidden = s !== "sell";
+    const code = codeOf();
+    const gross = Number(f.shares.value) * Number(f.price.value);
+    const est = estimateCosts(s, gross, code);
+    if (!f.fee.dataset.touched) f.fee.value = gross ? est.fee : "";
+    if (!f.tax.dataset.touched) f.tax.value = gross && s === "sell" ? est.tax : "";
+    const fee = Number(f.fee.value) || 0, tax = s === "sell" ? Number(f.tax.value) || 0 : 0;
+    $("#tr-amount").innerHTML = gross
+      ? `${s === "buy" ? "扣款" : "入帳"} ${money(s === "buy" ? gross + fee : gross - fee - tax, code)}`
+      : "—";
+  };
+  form.addEventListener("change", update);
+  form.addEventListener("input", (e) => {
+    if (e.target === f.fee || e.target === f.tax) e.target.dataset.touched = "1";
+    update();
+  });
+  update();
 }
 
 // ----- 貸款 -----
@@ -1831,12 +2051,25 @@ function accountPage(arg) {
   const bank = a.kind === "securities" ? settlementBankOf(a.id) : null;
   const cashAcc = bank ?? a;
   const rows = inMonth(state.month).filter((r) => accountEffects(r, cashAcc.id).length);
+  const monthTrades = state.trades.filter((t) => t.bank_id === cashAcc.id && t.date.startsWith(state.month));
   const flow = (sign) => rows.reduce((s, r) =>
-    s + accountEffects(r, cashAcc.id).reduce((x, e) => x + Math.max(0, sign * toBase(e.delta, e.code)), 0), 0);
+    s + accountEffects(r, cashAcc.id).reduce((x, e) => x + Math.max(0, sign * toBase(e.delta, e.code)), 0), 0)
+    + monthTrades.reduce((s, t) => s + Math.max(0, sign * toBase(tradeDelta(t, cashAcc.id, t.currency), t.currency)), 0);
   const multi = codes.length > 1;
-  const addButtons = Object.entries(TYPES).map(([type, t]) =>
+  // 證券戶沒有交割戶時不能記一般交易（證券戶只做股票交易）
+  const addButtons = a.kind === "securities" && !bank ? "" : Object.entries(TYPES).map(([type, t]) =>
     `<a class="btn btn-sm ${t.btn}" href="#/new/${type}/${cashAcc.id}">${icon("plus")} ${t.name}</a>`
   ).join("");
+  // 銀行（交割戶）頁：本月的股票交割
+  const settleList = a.kind === "bank" && monthTrades.length ? box(`${icon("stock")} 股票交割 <small class="muted">${monthLabel(state.month)}</small>`,
+    `<div class="table-wrap"><table class="table table-hover"><thead><tr><th>日期</th><th>證券戶</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">交割金額</th></tr></thead>
+      <tbody>${monthTrades.map((t) => `<tr><td class="nowrap">${t.date}</td>
+        <td><a href="#/account/${t.account_id}">${esc(accountName(t.account_id))}</a></td>
+        <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
+        <td>${esc(holdingLabel(state.holdings.find((h) => h.id === t.holding_id)))}</td>
+        <td class="text-right">${shareText(t.shares)}</td>
+        <td class="text-right">${signedAmount(tradeDelta(t, a.id, t.currency), t.currency)}</td></tr>`).join("")}</tbody>
+    </table></div>`, { cls: "box-default", flush: true }) : "";
 
   // 交割戶餘額方塊；證券戶自己若還有現金餘額會跟銀行重複，提醒歸零
   const settlementBoxes = bank
@@ -1923,6 +2156,7 @@ function accountPage(arg) {
     after() {
       makeSortable($("#holdingSort"), "/api/holdings/order", { handle: ".drag-handle" });
       if (a.kind === "loan") bindLoanForms(a);
+      if (a.kind === "securities") bindTradeForm();
       if (a.kind === "insurance") bindPolicyForms(a);
     },
     html: `
@@ -1933,15 +2167,17 @@ function accountPage(arg) {
         ${infoBox("red", "out", `${monthLabel(state.month)}流出`, money(flow(-1)), multi ? "換算台幣" : "")}
       </div>`}
       ${isSecurities ? holdingsBox(a) : ""}
+      ${isSecurities ? tradeSection(a, bank) : ""}
       ${a.kind === "credit" ? autopayBox(a) : ""}
       ${a.kind === "loan" ? loanSection(a) : ""}
-      ${isSecurities && !bank ? `<p class="muted hint">尚未設定交割戶：如果這個證券戶的錢是從某個銀行帳戶進出，到那個銀行帳戶頁的「證券交割戶」選擇這個證券戶。</p>` : ""}
+
       ${box(bank ? `交割戶交易紀錄 <small class="muted">${esc(bank.name)}</small>` : "交易紀錄", txTable(rows, { accountId: cashAcc.id }), {
         cls: k.box,
         flush: true,
         tools: monthNav(),
-        footer: `<div class="btn-row">${addButtons}</div>`,
+        footer: addButtons ? `<div class="btn-row">${addButtons}</div>` : "",
       })}
+      ${settleList}
       ${settlementBox}
       ${box(`${icon("coin")} 幣別與初始餘額${bank ? `<small class="muted">　證券戶自身（已連結交割戶，通常應為 0）</small>` : ""}`, currencyTable, { cls: "box-default", flush: true, footer: addCurrency })}`,
   };
@@ -2510,6 +2746,7 @@ const PAGES = {
   income: () => listPage("income"),
   transfer: () => listPage("transfer"),
   new: newPage,
+  edit: editPage,
   fixed: fixedPage,
   assets: assetsPage,
   prefs: prefsPage,
@@ -2551,6 +2788,7 @@ function menuHtml(route, arg) {
 
 function render() {
   const [route = "", arg, arg2] = location.hash.replace(/^#\/?/, "").split("/");
+  if (route !== "account") state.editTrade = null;
   const page = (PAGES[route] || PAGES[""])(arg, arg2);
 
   document.title = tr(`${page.title} · 記帳本`);
@@ -2658,6 +2896,40 @@ $("#content").addEventListener("click", async (e) => {
         ? ["warning", `已記錄今天的資產；股價查不到：${r.failed.join("、")}（用原本的價格）`]
         : ["success", `已更新股價並記錄今天的資產（${state.settings.snapshot_time} 會再自動記一次並取代這筆）`];
     });
+  }
+
+  const edit = e.target.closest("[data-edit]");
+  if (edit) {
+    state.returnTo = location.hash || "#/";
+    location.hash = `#/edit/${edit.dataset.edit}`;
+    return;
+  }
+  const tradeEdit = e.target.closest("[data-trade-edit]");
+  if (tradeEdit) {
+    state.editTrade = Number(tradeEdit.dataset.tradeEdit);
+    render();
+    $("[data-trade-form]")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
+  if (e.target.closest("[data-trade-cancel]")) {
+    state.editTrade = null;
+    return render();
+  }
+  const tradeDel = e.target.closest("[data-trade-del]");
+  if (tradeDel) {
+    const t = state.trades.find((x) => x.id === Number(tradeDel.dataset.tradeDel));
+    const h = state.holdings.find((x) => x.id === t.holding_id);
+    if (!confirm(`刪除這筆股票交易？\n${t.date} ${SIDES[t.side].name} ${holdingLabel(h)} ${shareText(t.shares)} 股\n持股與損益會重新計算。`)) return;
+    return mutate(async () => {
+      await api(`/api/trades/${t.id}`, { method: "DELETE" });
+      if (state.editTrade === t.id) state.editTrade = null;
+      state.flash = ["success", "已刪除股票交易，持股與損益已重新計算"];
+    });
+  }
+  const tradeYear = e.target.closest("[data-trade-year]");
+  if (tradeYear) {
+    state.tradeYear = String(Number(state.tradeYear ?? state.month.slice(0, 4)) + Number(tradeYear.dataset.tradeYear));
+    return render();
   }
 
   const nav = e.target.closest("[data-month]");
@@ -2909,6 +3181,26 @@ $("#content").addEventListener("submit", (e) => {
     e.preventDefault();
     const id = form.dataset.addAccCur;
     return mutate(() => postJson(`/api/accounts/${id}/currencies`, { currency: f.cur.value, initial_balance: f.initial.value || 0 }));
+  }
+
+  if (form.matches("[data-trade-form]")) {
+    e.preventDefault();
+    const side = form.querySelector('input[name="side"]:checked').value;
+    const body = {
+      account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value, price: f.price.value,
+      fee: f.fee.value || 0, tax: side === "sell" ? f.tax.value || 0 : 0, note: f.note.value,
+    };
+    if (f.holding_id.value) body.holding_id = f.holding_id.value;
+    else Object.assign(body, { symbol: f.symbol.value, currency: f.currency.value });
+    const editingId = state.editTrade;
+    return mutate(async () => {
+      const r = editingId ? await putJson(`/api/trades/${editingId}`, body) : await postJson("/api/trades", body);
+      state.editTrade = null;
+      const t = editingId ? state.trades.find((x) => x.id === editingId) : r;
+      state.flash = ["success", editingId ? "已修改股票交易，持股與損益已重新計算"
+        : side === "sell" ? `已記錄賣出，已實現損益 ${t.realized >= 0 ? "+" : ""}${money(t.realized, t.currency)}`
+        : `已記錄買進，交割戶扣款 ${money(t.amount, t.currency)}`];
+    });
   }
 
   if (form.matches("[data-add-fixed]")) {

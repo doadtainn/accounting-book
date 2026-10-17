@@ -28,9 +28,9 @@
 | 資產變化 | 伺服器每天定時（預設 17:00）先更新匯率、股價，再記錄現金資產／證券資產／債務／淨資產（`asset_snapshots`）；同一張圖：現金、證券、債務畫直方，淨資產畫折線；30／90／120 天／1 年切換；組數太多就改每週、每月最後一筆；每日紀錄表 |
 | 行事曆 | 月曆格子顯示每天收入（綠）支出（紅）、有轉帳標藍點；下方嵌「新增交易」表單（點日期換日期，用來補登），再下方是當天交易 |
 | 支出／收入頁 | 上方分類佔比環形圖（依分類／依帳戶）；點一塊開明細：子分類佔比、與上月比較、該分類每筆交易（金額由大到小）；下方是紀錄 |
-| 新增交易 | 支出／收入／轉帳；主分類＋子分類；帳戶＋幣別；跨幣別轉帳（換匯）要填轉入金額；轉入貸款可勾「額外還款」 |
+| 新增／修改交易 | 支出／收入／轉帳；主分類＋子分類；帳戶＋幣別（**不列證券戶**，證券戶只做股票交易）；跨幣別轉帳（換匯）要填轉入金額；轉入貸款可勾「額外還款」。交易列表每列有 ✏️ 修改（`#/edit/<id>`，存完回 `state.returnTo`）；貸款還款、利息、保費鎖住不能改（`entryLocked()`／`_entry_locked()`） |
 | 一般帳戶頁 | 各幣別餘額、本月流入流出、交易紀錄、幣別與初始餘額；銀行可設定為某證券戶的「證券交割戶」 |
-| 證券戶頁 | 持股表（代號、名稱、股數、成本、價格可直接改；均價、市值、損益、報酬率自動算；下市標記；拖曳排序；更新股價）；有交割戶時顯示銀行餘額與交易 |
+| 證券戶頁 | 持股表（代號、名稱、股數、成本、價格可直接改；均價、市值、損益、報酬率自動算；下市標記；拖曳排序；更新股價）；**股票交易**（買進／賣出，自動估算台股手續費與證交稅，本月／今年／累計已實現損益、每月損益表、交易紀錄可修改刪除；**必須綁定交割戶**）；有交割戶時顯示銀行餘額與交易 |
 | 信用卡頁 | 目前欠款、自動扣款（自動入帳／提醒確認） |
 | 貸款頁 | 貸款設定、記錄還款（本期／額外）、還款進度、還款紀錄（核對期數、標示同月重複、刪除整筆、重新編號並重算利息）、與銀行核對剩餘本金 |
 | 保險頁 | 保單設定、繳保費、繳費紀錄、下次繳費日；儲蓄型顯示保單價值與解約損益 |
@@ -65,7 +65,8 @@
 | `accounts` | `kind` = bank／securities／credit／loan／insurance。`settlement_for`：銀行帳戶是哪個證券戶的交割戶。`initial_balance` 是舊欄位，已不用。 |
 | `account_currencies` | 帳戶持有哪些幣別與各自初始餘額（主鍵 account_id + currency）。 |
 | `currencies` | 幣別與「1 單位 = 幾台幣」匯率；TWD 是本位幣（匯率固定 1、不能刪）。`rate_time`：從 Yahoo 更新的時間，空白＝手動設定。畫面顯示到小數點後 4 位。 |
-| `holdings` | 證券戶持股：代號、名稱、股數、總成本、目前價格、幣別、`price_time`、`delisted`（已下市，更新股價時略過）。 |
+| `holdings` | 證券戶持股：代號、名稱、股數、總成本、目前價格、幣別、`price_time`、`delisted`（已下市，更新股價時略過）。`base_shares`／`base_cost`：期初持股（股票交易紀錄之前的部位）；**有交易時 `shares`／`cost` 由 `recalc_holding()` 重播算出**，手動改股數成本會回推期初（`_holding_base()`）。 |
+| `trades` | 股票交易：`side` buy／sell、股數、價格、手續費、證交稅、`amount` 交割金額（買＝股數×價＋費；賣＝股數×價－費－稅）、`bank_id` 交易當時的交割戶、`currency`（跟持股）。`cost_basis`／`realized` 由重播算（移動平均成本），不要手動寫。 |
 | `loans` | 貸款設定（借款金額、年利率、月付、期數、首期日、扣款帳戶、與銀行核對的 `bank_balance`／`bank_date`）。 |
 | `policies` | 保單設定；`policy_type` = protection（保障型）／savings（儲蓄型），`cash_value` 保單價值。 |
 | `fixed_costs` | 手動固定開銷（名稱、金額、幣別、`frequency` 1／3／6／12 個月、分類、可不填的 `account_id`、`active`）。只用於統計；API 路徑是 `fixedcosts`。`kind`／`to_account_id` 欄位目前沒有使用。 |
@@ -87,6 +88,7 @@
 - **貸款**：有年利率時，「本期還款」拆成利息（支出，金融保險 › 利息支出，`loan_kind=interest`）＋本金（轉帳）；利息 = 剩餘本金 × 年利率 ÷ 12（與銀行按日計息的小差額用「與銀行核對 → 調整最近一期」修正）。額外還款全算本金。
 - **保險**：保障型保費記成支出（金融保險 › 保險費），**不計入資產**；儲蓄型保費轉入保單，資產以 `cash_value`（有填時）為準。
 - **證券戶**：帳戶價值 = 自身現金 + 持股市值。有交割戶時，證券戶頁面顯示銀行餘額與交易，但**淨資產只算一次**（`accountWorth` 不含交割戶；`securitiesDisplayWorth` 只用於顯示）。
+- **股票交易不算收入支出**：不寫進 `entries`，用 `trades` 表；交割金額直接影響交割戶餘額（前端 `balance()` 的 `tradeDelta`、伺服器 `account_balance()` 都要算進去）。新增、修改、刪除交易後一定 `recalc_holding()`：依日期重播「期初＋所有買賣」，賣超過當時持股就丟錯（整筆不寫入）。持股有交易時不能刪；帳戶有交易時不能刪。
 - **淨資產** = 資產（各帳戶正餘額＋持股市值＋儲蓄型保單價值）− 負債（信用卡、貸款、帳戶負餘額），見 `assetTotals()`。
 - **資產快照**：`asset_totals(conn)` 是前端 `assetTotals()` 的伺服器版（改一邊就要改另一邊）。`snapshot_scheduler()` 每分鐘檢查：過了 `settings.snapshot_time`（依 `tz_offset` 時區）且今天沒有 `auto=1` 的紀錄就 `take_snapshot()`（先 `refresh_rates()`、`refresh_prices()`）；開機晚了會補記當天，更早漏掉的日子不補。測試伺服器不啟動排程。
 - **自動扣款**：`process_autopays()` 在伺服器啟動與每次 `GET /api/entries` 時，把「自動入帳」已到期的補記成支出；31 號遇小月取月底；`last_posted` 之前的不會重記。「提醒確認」由前端列出，確認後 `POST /api/autopays/<id>/post`。
@@ -95,11 +97,11 @@
 
 全部在 `/api/...`，JSON；錯誤回 400 `{"error": "中文訊息"}`。
 
-- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／loans／policies／autopays／fixedcosts／snapshots／settings
-- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、autopays、fixedcosts、snapshots（手動記錄今天）；`currencies/refresh`；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
-- `PUT` `settings`；`<表>/<id>`；`<accounts|categories|currencies|holdings|autopays|fixedcosts>/order`（`{ids}` 拖曳排序）；`accounts/<id>/currencies/<代碼>`（初始餘額）
+- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／trades／loans／policies／autopays／fixedcosts／snapshots／settings
+- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、trades（`holding_id`，或新股票給 `symbol`＋`currency`，買進時自動建持股）、autopays、fixedcosts、snapshots（手動記錄今天）；`currencies/refresh`；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
+- `PUT` `settings`；`<表>/<id>`（含 `entries/<id>` 修改交易、`trades/<id>`）；`<accounts|categories|currencies|holdings|autopays|fixedcosts>/order`（`{ids}` 拖曳排序）；`accounts/<id>/currencies/<代碼>`（初始餘額）
 - `DELETE` `<表>/<id>`；`accounts/<id>/currencies/<代碼>`；`loans/<id>/payments/<轉帳id>`（本金＋配對利息一起刪）
-- 刪除有保護：帳戶有交易或持股不能刪、幣別被使用不能刪、帳戶最後一個幣別不能移除。
+- 刪除有保護：帳戶有交易、股票交易或持股不能刪；持股有股票交易不能刪；幣別被使用不能刪；帳戶最後一個幣別不能移除。
 
 ## 前端慣例（`app.js`）
 
@@ -109,7 +111,7 @@
 - 使用者輸入一律 `esc()`；金額用 `money(n, code)`，大數字可用 `shortMoney`。
 - **隱私模式**（`state.privacy`，存在各裝置）：`money()`／`shortMoney()` 回傳 `NT$ *****`，數字輸入框靠 CSS 模糊。**任何金額、股數都必須經過 `money()`／`shortMoney()` 或判斷 `state.privacy`**；百分比可以照常顯示。
 - **月份切換**：`monthNav()` 的年月文字上蓋透明 `<input type="month" data-month-pick>`，點了叫出原生年月選擇器；月份存在 `state.month`，各頁共用。
-- **新增交易表單是共用的 `txForm(type, preset, {date, embedded})`**：`newPage` 和行事曆都用它；點行事曆日期走 `selectCalDay()`，只換局部，不重畫整頁。
+- **新增交易表單是共用的 `txForm(type, preset, {date, embedded, entry})`**：`newPage`、行事曆、`editPage`（`entry` 有值＝修改，帶入原本的分類、帳戶、幣別、金額）都用它；帳戶下拉用 `accountOptions(id, { cashOnly: true })`（不列證券戶，但舊交易原本選的仍保留）；點行事曆日期走 `selectCalDay()`，只換局部，不重畫整頁。
 - **時區**：用固定時差 `tz_offset`（有些 Windows 的 Python 沒有 IANA 時區資料），夏令時間不會自動切換。伺服器用 `local_now()`／`local_today()`；前端 `today()` 載入設定後改用 `tzOffset`。
 - **字體大小用整頁 `zoom`**：浮動提示一律用 `placeTip(tip, e)`（會除以 zoom）。
 - **語言**：程式裡的文字一律寫繁體中文，切換語言是在畫面層轉換（`trText`），資料不改：
@@ -155,7 +157,8 @@
 
 ## 已知限制與可能的下一步
 
-- **交易不能編輯**，只能刪除後重記。
+- 貸款還款、利息、保費不能直接修改，要在該帳戶頁刪除後重記。
+- 股票已實現損益用移動平均成本（部分券商用先進先出，數字會略有不同）；沒有股利、除權息紀錄。
 - **隱私模式只是遮住畫面**，不是密碼保護。
 - **沒有自動備份**，也沒有登入功能（不能公開到網路）、沒有離線記帳。
 - 中文股名只涵蓋上市、上櫃、興櫃；外國股票用 Yahoo 的英文名稱（可自行改名，不會被覆蓋）。
