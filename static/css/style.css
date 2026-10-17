@@ -286,6 +286,8 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .tag-sell { color: var(--stock-down); border-color: var(--stock-down); }
 .row-editing td { background: var(--surface-2); }
 .trade-list { min-width: 860px; }
+.trade-months { min-width: 620px; }
+.trade-months th, .trade-months tfoot td:first-child { white-space: nowrap; }
 .trade-list th, .trade-list td:nth-child(3) { white-space: nowrap; }
 .trade-form .form-group { grid-template-columns: 90px 1fr; }
 .side-btn { cursor: pointer; min-width: 64px; justify-content: center; }

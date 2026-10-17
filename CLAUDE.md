@@ -66,6 +66,7 @@
 | `account_currencies` | 帳戶持有哪些幣別與各自初始餘額（主鍵 account_id + currency）。 |
 | `currencies` | 幣別與「1 單位 = 幾台幣」匯率；TWD 是本位幣（匯率固定 1、不能刪）。`rate_time`：從 Yahoo 更新的時間，空白＝手動設定。畫面顯示到小數點後 4 位。 |
 | `holdings` | 證券戶持股：代號、名稱、股數、總成本、目前價格、幣別、`price_time`、`delisted`（已下市，更新股價時略過）。`base_shares`／`base_cost`：期初持股（股票交易紀錄之前的部位）；**有交易時 `shares`／`cost` 由 `recalc_holding()` 重播算出**，手動改股數成本會回推期初（`_holding_base()`）。 |
+| `rebates` | 手續費折讓（券商先收足手續費、事後退回）：`account_id` 證券戶、`bank_id` 交割戶、日期、金額、幣別、備註。入帳到交割戶，不算收入（前端 `rebateDelta`、伺服器 `account_balance()` 都要算）；證券戶頁的每月損益表另列「折讓款」「損益＋折讓」。 |
 | `trades` | 股票交易：`side` buy／sell、股數、價格、手續費、證交稅、`amount` 交割金額（買＝股數×價＋費；賣＝股數×價－費－稅）、`bank_id` 交易當時的交割戶、`currency`（跟持股）。`cost_basis`／`realized` 由重播算（移動平均成本），不要手動寫。 |
 | `loans` | 貸款設定（借款金額、年利率、月付、期數、首期日、扣款帳戶、與銀行核對的 `bank_balance`／`bank_date`）。 |
 | `policies` | 保單設定；`policy_type` = protection（保障型）／savings（儲蓄型），`cash_value` 保單價值。 |
@@ -97,8 +98,8 @@
 
 全部在 `/api/...`，JSON；錯誤回 400 `{"error": "中文訊息"}`。
 
-- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／trades／loans／policies／autopays／fixedcosts／snapshots／settings
-- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、trades（`holding_id`，或新股票給 `symbol`＋`currency`，買進時自動建持股）、autopays、fixedcosts、snapshots（手動記錄今天）；`currencies/refresh`；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
+- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／trades／rebates／loans／policies／autopays／fixedcosts／snapshots／settings
+- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、rebates、trades（`holding_id`，或新股票給 `symbol`＋`currency`，買進時自動建持股）、autopays、fixedcosts、snapshots（手動記錄今天）；`currencies/refresh`；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
 - `PUT` `settings`；`<表>/<id>`（含 `entries/<id>` 修改交易、`trades/<id>`）；`<accounts|categories|currencies|holdings|autopays|fixedcosts>/order`（`{ids}` 拖曳排序）；`accounts/<id>/currencies/<代碼>`（初始餘額）
 - `DELETE` `<表>/<id>`；`accounts/<id>/currencies/<代碼>`；`loans/<id>/payments/<轉帳id>`（本金＋配對利息一起刪）
 - 刪除有保護：帳戶有交易、股票交易或持股不能刪；持股有股票交易不能刪；幣別被使用不能刪；帳戶最後一個幣別不能移除。

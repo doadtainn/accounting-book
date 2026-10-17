@@ -102,7 +102,7 @@ const shiftMonth = (m, delta) => {
 };
 
 // ===== 資料 =====
-const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], snapshots: [], settings: {}, trades: [], month: today().slice(0, 7), flash: null };
+const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], snapshots: [], settings: {}, trades: [], rebates: [], month: today().slice(0, 7), flash: null };
 // 隱私模式：金額顯示成 *****；開關記在這台裝置（手機設了不影響電腦）
 const MASK = "*****";
 state.privacy = (() => {
@@ -261,11 +261,13 @@ function accountEffects(r, id) {
   return [...codes].map((code) => ({ code, delta: accountDelta(r, id, code) })).filter((e) => e.delta !== 0);
 }
 // 股票交割對交割戶的影響：買進扣款、賣出入帳
+const rebateDelta = (r, id, code) => (r.bank_id === id && r.currency === code ? r.amount : 0); // 手續費折讓入帳
 const tradeDelta = (t, id, code) => (t.bank_id === id && t.currency === code ? (t.side === "sell" ? t.amount : -t.amount) : 0);
 function balance(id, code) {
   const initial = findAccount(id)?.currencies.find((h) => h.currency === code)?.initial_balance ?? 0;
   const cash = state.entries.reduce((b, r) => b + accountDelta(r, id, code), initial);
-  return state.trades.reduce((b, t) => b + tradeDelta(t, id, code), cash);
+  const traded = state.trades.reduce((b, t) => b + tradeDelta(t, id, code), cash);
+  return state.rebates.reduce((b, r) => b + rebateDelta(r, id, code), traded);
 }
 // 帳戶所有幣別換算成台幣的總額
 function balanceBase(id) {
@@ -320,7 +322,7 @@ async function api(path, opts = {}) {
   return data;
 }
 async function reload() {
-  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades] = await Promise.all([
+  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades, state.rebates] = await Promise.all([
     api("/api/entries?month="),
     api("/api/categories"),
     api("/api/accounts"),
@@ -333,6 +335,7 @@ async function reload() {
     api("/api/snapshots"),
     api("/api/settings"),
     api("/api/trades"),
+    api("/api/rebates"),
   ]);
   tzOffset = Number(state.settings.tz_offset);
 }
@@ -1433,22 +1436,31 @@ function tradeSection(a, bank) {
   const hasCost = (k) => editing && v[k] !== "" ? ` data-touched="1"` : "";
 
   // 每月已實現損益（台幣）
+  const rebates = rebatesOf(a.id);
+  const yearRebates = rebates.filter((r) => r.date.startsWith(year));
   const months = Array.from({ length: 12 }, (_, i) => `${year}-${pad2(i + 1)}`).map((m) => {
     const list = yearTrades.filter((t) => t.date.startsWith(m));
     const sum = (side) => list.filter((t) => t.side === side).reduce((s, t) => s + toBase(t.amount, t.currency), 0);
-    return { m, count: list.length, buy: sum("buy"), sell: sum("sell"), realized: realizedBase(list) };
+    const rebate = rebateBase(yearRebates.filter((r) => r.date.startsWith(m)));
+    return { m, count: list.length, buy: sum("buy"), sell: sum("sell"), realized: realizedBase(list), rebate };
   });
+  const yearRebate = rebateBase(yearRebates);
   const monthTable = `<div class="table-wrap"><table class="table table-hover trade-months">
-      <thead><tr><th>月份</th><th class="text-right">筆數</th><th class="text-right">買進金額</th><th class="text-right">賣出金額</th><th class="text-right">已實現損益</th></tr></thead>
-      <tbody>${months.map((r) => `<tr class="${r.count ? "" : "row-muted"}">
+      <thead><tr><th>月份</th><th class="text-right">筆數</th><th class="text-right">買進金額</th><th class="text-right">賣出金額</th><th class="text-right">已實現損益</th>
+        <th class="text-right">折讓款</th><th class="text-right">損益＋折讓</th></tr></thead>
+      <tbody>${months.map((r) => `<tr class="${r.count || r.rebate ? "" : "row-muted"}">
         <td>${Number(r.m.slice(5))} 月</td><td class="text-right">${r.count || "—"}</td>
         <td class="text-right amount">${r.buy ? money(Math.round(r.buy)) : "—"}</td>
         <td class="text-right amount">${r.sell ? money(Math.round(r.sell)) : "—"}</td>
-        <td class="text-right">${r.realized ? plText(Math.round(r.realized)) : "—"}</td></tr>`).join("")}</tbody>
+        <td class="text-right">${r.realized ? plText(Math.round(r.realized)) : "—"}</td>
+        <td class="text-right">${r.rebate ? plText(Math.round(r.rebate)) : "—"}</td>
+        <td class="text-right">${r.realized || r.rebate ? plText(Math.round(r.realized + r.rebate)) : "—"}</td></tr>`).join("")}</tbody>
       <tfoot><tr><td><strong>${year} 年合計</strong></td><td class="text-right">${yearTrades.length}</td>
         <td class="text-right amount">${money(Math.round(months.reduce((s, r) => s + r.buy, 0)))}</td>
         <td class="text-right amount">${money(Math.round(months.reduce((s, r) => s + r.sell, 0)))}</td>
-        <td class="text-right"><strong>${plText(Math.round(realizedBase(yearTrades)))}</strong></td></tr></tfoot>
+        <td class="text-right"><strong>${plText(Math.round(realizedBase(yearTrades)))}</strong></td>
+        <td class="text-right"><strong>${plText(Math.round(yearRebate))}</strong></td>
+        <td class="text-right"><strong>${plText(Math.round(realizedBase(yearTrades) + yearRebate))}</strong></td></tr></tfoot>
     </table></div>`;
 
   const list = yearTrades.length
@@ -1511,17 +1523,60 @@ function tradeSection(a, bank) {
       <span class="btn btn-default btn-sm static">${year} 年</span>
       <button class="btn btn-default btn-sm" data-trade-year="1" aria-label="後一年">›</button></div>`;
   return `
-    <div class="grid grid-3">
+    <div class="grid grid-4">
       ${infoBox("aqua", "calendar", `${monthLabel(state.month)}已實現損益`, plText(Math.round(realizedBase(trades.filter((t) => t.date.startsWith(state.month))))), "換算台幣")}
       ${infoBox("yellow", "chart", `${state.month.slice(0, 4)} 年已實現損益`, plText(Math.round(realizedBase(trades.filter((t) => t.date.startsWith(state.month.slice(0, 4)))))), "換算台幣")}
       ${infoBox("purple", "scale", "累計已實現損益", plText(Math.round(realizedBase(trades))), `${trades.filter((t) => t.side === "sell").length} 筆賣出`)}
+      ${infoBox("green", "coin", `${state.month.slice(0, 4)} 年折讓款`, plText(Math.round(rebateBase(rebates.filter((r) => r.date.startsWith(state.month.slice(0, 4)))))),
+        `累計 ${money(Math.round(rebateBase(rebates)))}`)}
     </div>
     <div class="grid grid-2">
       ${box(`${icon(editing ? "edit" : "plus")} ${editing ? "修改股票交易" : "記錄股票交易"}`, form + feeSettingsBox(a), { cls: editing ? "box-warning" : "box-primary" })}
       ${box(`${icon("chart")} 每月已實現損益`, monthTable, { cls: "box-default", flush: true, tools: yearNav,
         footer: `<span class="muted hint-inline">已實現損益＝賣出交割金額－賣出股數的平均成本（移動平均，含買進手續費）；外幣換算台幣</span>` })}
     </div>
-    ${box(`${icon("list")} 股票交易紀錄 <small class="muted">${year} 年</small>`, list, { cls: "box-default", flush: true, tools: yearNav })}`;
+    ${box(`${icon("list")} 股票交易紀錄 <small class="muted">${year} 年</small>`, list, { cls: "box-default", flush: true, tools: yearNav })}
+    ${rebateBox(a, bank, year, yearRebates, yearNav)}`;
+}
+
+// ----- 手續費折讓：券商退回的手續費，入帳到交割戶 -----
+const rebatesOf = (accountId) => state.rebates.filter((r) => r.account_id === accountId);
+const rebateBase = (list) => list.reduce((s, r) => s + toBase(r.amount, r.currency), 0);
+
+function rebateBox(a, bank, year, list, yearNav) {
+  const editing = state.rebates.find((r) => r.id === state.editRebate);
+  const codes = accountCodes(bank);
+  const v = editing ?? { date: today(), amount: "", currency: codes[0] ?? BASE, note: "" };
+  const table = list.length
+    ? `<div class="table-wrap"><table class="table table-hover">
+        <thead><tr><th>日期</th><th class="text-right">折讓款</th><th>備註</th><th></th></tr></thead>
+        <tbody>${list.map((r) => `<tr class="${r.id === state.editRebate ? "row-editing" : ""}">
+          <td class="nowrap">${r.date}</td>
+          <td class="text-right">${signedAmount(r.amount, r.currency)}</td>
+          <td class="muted">${esc(r.note) || "—"}</td>
+          <td class="text-right nowrap">
+            <button class="btn btn-xs btn-default" data-rebate-edit="${r.id}" title="修改">${icon("edit")}</button>
+            <button class="btn btn-xs btn-default" data-rebate-del="${r.id}" title="刪除">${icon("trash")}</button></td>
+        </tr>`).join("")}</tbody>
+        <tfoot><tr><td><strong>${year} 年合計</strong></td><td class="text-right"><strong>${plText(Math.round(rebateBase(list)))}</strong></td><td colspan="2"></td></tr></tfoot>
+      </table></div>`
+    : `<p class="empty">${year} 年沒有折讓款</p>`;
+  return box(`${icon("coin")} 手續費折讓 <small class="muted">${year} 年</small>`, table, {
+    cls: "box-success",
+    flush: true,
+    tools: yearNav,
+    footer: `<form class="inline-form" data-rebate-form="${a.id}">
+        <input class="form-control" name="date" type="date" value="${esc(v.date)}" required aria-label="日期">
+        ${codes.length > 1 ? `<select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, v.currency)}</select>`
+          : `<input type="hidden" name="currency" value="${esc(v.currency)}">`}
+        <input class="form-control num-input" name="amount" type="number" min="0.01" step="any" inputmode="decimal" value="${v.amount}" placeholder="折讓金額" required>
+        <input class="form-control" name="note" value="${esc(v.note)}" placeholder="備註，例如：9 月手續費折讓">
+        ${editing ? `<button class="btn btn-default" type="button" data-rebate-cancel>取消</button>` : ""}
+        <button class="btn btn-success" type="submit">${icon(editing ? "edit" : "plus")} ${editing ? "儲存修改" : "記錄折讓款"}</button>
+      </form>
+      <p class="muted hint">券商成交時先收足手續費、之後退回折扣的，退款入帳時記在這裡（會入帳到交割戶「${esc(bank.name)}」，不算收入）。
+        如果券商是成交當下就打折，改上面的「手續費設定」就好，不用記折讓款。</p>`,
+  });
 }
 
 // 手續費設定（折疊）：改完離開欄位就儲存；清空＝回到預設
@@ -2088,23 +2143,29 @@ function accountPage(arg) {
   const cashAcc = bank ?? a;
   const rows = inMonth(state.month).filter((r) => accountEffects(r, cashAcc.id).length);
   const monthTrades = state.trades.filter((t) => t.bank_id === cashAcc.id && t.date.startsWith(state.month));
+  const monthRebates = state.rebates.filter((r) => r.bank_id === cashAcc.id && r.date.startsWith(state.month));
   const flow = (sign) => rows.reduce((s, r) =>
     s + accountEffects(r, cashAcc.id).reduce((x, e) => x + Math.max(0, sign * toBase(e.delta, e.code)), 0), 0)
-    + monthTrades.reduce((s, t) => s + Math.max(0, sign * toBase(tradeDelta(t, cashAcc.id, t.currency), t.currency)), 0);
+    + monthTrades.reduce((s, t) => s + Math.max(0, sign * toBase(tradeDelta(t, cashAcc.id, t.currency), t.currency)), 0)
+    + (sign > 0 ? rebateBase(monthRebates) : 0);
   const multi = codes.length > 1;
   // 證券戶沒有交割戶時不能記一般交易（證券戶只做股票交易）
   const addButtons = a.kind === "securities" && !bank ? "" : Object.entries(TYPES).map(([type, t]) =>
     `<a class="btn btn-sm ${t.btn}" href="#/new/${type}/${cashAcc.id}">${icon("plus")} ${t.name}</a>`
   ).join("");
   // 銀行（交割戶）頁：本月的股票交割
-  const settleList = a.kind === "bank" && monthTrades.length ? box(`${icon("stock")} 股票交割 <small class="muted">${monthLabel(state.month)}</small>`,
+  const settleList = a.kind === "bank" && (monthTrades.length || monthRebates.length) ? box(`${icon("stock")} 股票交割 <small class="muted">${monthLabel(state.month)}</small>`,
     `<div class="table-wrap"><table class="table table-hover"><thead><tr><th>日期</th><th>證券戶</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">交割金額</th></tr></thead>
       <tbody>${monthTrades.map((t) => `<tr><td class="nowrap">${t.date}</td>
         <td><a href="#/account/${t.account_id}">${esc(accountName(t.account_id))}</a></td>
         <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
         <td>${esc(holdingLabel(state.holdings.find((h) => h.id === t.holding_id)))}</td>
         <td class="text-right">${shareText(t.shares)}</td>
-        <td class="text-right">${signedAmount(tradeDelta(t, a.id, t.currency), t.currency)}</td></tr>`).join("")}</tbody>
+        <td class="text-right">${signedAmount(tradeDelta(t, a.id, t.currency), t.currency)}</td></tr>`).join("")}
+        ${monthRebates.map((r) => `<tr><td class="nowrap">${r.date}</td>
+          <td><a href="#/account/${r.account_id}">${esc(accountName(r.account_id))}</a></td>
+          <td><span class="code-tag tag-sell">折讓</span></td><td class="muted">${esc(r.note) || "手續費折讓"}</td><td></td>
+          <td class="text-right">${signedAmount(r.amount, r.currency)}</td></tr>`).join("")}</tbody>
     </table></div>`, { cls: "box-default", flush: true }) : "";
 
   // 交割戶餘額方塊；證券戶自己若還有現金餘額會跟銀行重複，提醒歸零
@@ -2824,7 +2885,7 @@ function menuHtml(route, arg) {
 
 function render() {
   const [route = "", arg, arg2] = location.hash.replace(/^#\/?/, "").split("/");
-  if (route !== "account") state.editTrade = null;
+  if (route !== "account") state.editTrade = state.editRebate = null;
   const page = (PAGES[route] || PAGES[""])(arg, arg2);
 
   document.title = tr(`${page.title} · 記帳本`);
@@ -2960,6 +3021,27 @@ $("#content").addEventListener("click", async (e) => {
       await api(`/api/trades/${t.id}`, { method: "DELETE" });
       if (state.editTrade === t.id) state.editTrade = null;
       state.flash = ["success", "已刪除股票交易，持股與損益已重新計算"];
+    });
+  }
+  const rebateEdit = e.target.closest("[data-rebate-edit]");
+  if (rebateEdit) {
+    state.editRebate = Number(rebateEdit.dataset.rebateEdit);
+    render();
+    $("[data-rebate-form]")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
+  if (e.target.closest("[data-rebate-cancel]")) {
+    state.editRebate = null;
+    return render();
+  }
+  const rebateDel = e.target.closest("[data-rebate-del]");
+  if (rebateDel) {
+    const r = state.rebates.find((x) => x.id === Number(rebateDel.dataset.rebateDel));
+    if (!confirm(`刪除這筆折讓款？\n${r.date} ${money(r.amount, r.currency)}`)) return;
+    return mutate(async () => {
+      await api(`/api/rebates/${r.id}`, { method: "DELETE" });
+      if (state.editRebate === r.id) state.editRebate = null;
+      state.flash = ["success", "已刪除折讓款"];
     });
   }
   const tradeYear = e.target.closest("[data-trade-year]");
@@ -3224,6 +3306,18 @@ $("#content").addEventListener("submit", (e) => {
     e.preventDefault();
     const id = form.dataset.addAccCur;
     return mutate(() => postJson(`/api/accounts/${id}/currencies`, { currency: f.cur.value, initial_balance: f.initial.value || 0 }));
+  }
+
+  if (form.matches("[data-rebate-form]")) {
+    e.preventDefault();
+    const body = { account_id: form.dataset.rebateForm, date: f.date.value, amount: f.amount.value, currency: f.currency.value, note: f.note.value };
+    const editingId = state.editRebate;
+    return mutate(async () => {
+      if (editingId) await putJson(`/api/rebates/${editingId}`, body);
+      else await postJson("/api/rebates", body);
+      state.editRebate = null;
+      state.flash = ["success", `${editingId ? "已修改" : "已記錄"}折讓款 ${money(Number(body.amount), body.currency)}，入帳到交割戶`];
+    });
   }
 
   if (form.matches("[data-trade-form]")) {

@@ -175,6 +175,18 @@ TRADES_SQL = """CREATE TABLE IF NOT EXISTS trades (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )"""
 
+# 手續費折讓：券商成交時先收足手續費，之後把折扣退回交割戶（bank_id）；不算收入，和股票交易一樣直接影響交割戶餘額
+REBATES_SQL = """CREATE TABLE IF NOT EXISTS rebates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    bank_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    amount REAL NOT NULL CHECK (amount > 0),
+    currency TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)"""
+
 # 貸款設定：每筆貸款一列（account_id 就是貸款帳戶的 id）
 LOANS_SQL = """CREATE TABLE IF NOT EXISTS loans (
     account_id INTEGER PRIMARY KEY,
@@ -378,6 +390,7 @@ def init_db():
         conn.execute(FIXED_COSTS_SQL)
         conn.execute(SNAPSHOTS_SQL)
         conn.execute(TRADES_SQL)
+        conn.execute(REBATES_SQL)
         account_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
         if "fee_rate" not in account_cols:  # 證券戶的手續費率（%）、最低手續費、賣出稅費率（%）；NULL＝依幣別預設
             for col in ("fee_rate", "fee_min", "tax_rate"):
@@ -460,10 +473,13 @@ def account_balance(conn, id_, code):
         "SELECT COALESCE(SUM(to_amount), 0) FROM entries WHERE type = 'transfer' AND to_account_id = ? AND to_currency = ?",
         (id_, code),
     ).fetchone()[0]
-    # 股票交割：買進扣款、賣出入帳
+    # 股票交割：買進扣款、賣出入帳；手續費折讓入帳
     total += conn.execute(
         "SELECT COALESCE(SUM(CASE side WHEN 'sell' THEN amount ELSE -amount END), 0) FROM trades "
         "WHERE bank_id = ? AND currency = ?", (id_, code),
+    ).fetchone()[0]
+    total += conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM rebates WHERE bank_id = ? AND currency = ?", (id_, code),
     ).fetchone()[0]
     return total
 
@@ -853,6 +869,10 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 rows = conn.execute("SELECT * FROM autopays ORDER BY sort, id").fetchall()
             return self._json([dict(r) for r in rows])
+        if url.path == "/api/rebates":
+            with db() as conn:
+                rows = conn.execute("SELECT * FROM rebates ORDER BY date DESC, id DESC").fetchall()
+            return self._json([dict(r) for r in rows])
         if url.path == "/api/trades":
             with db() as conn:
                 rows = conn.execute("SELECT * FROM trades ORDER BY date DESC, id DESC").fetchall()
@@ -896,6 +916,7 @@ class Handler(SimpleHTTPRequestHandler):
             ("currencies",): self._create_currency,
             ("currencies", "refresh"): self._refresh_rates,
             ("trades",): self._create_trade,
+            ("rebates",): self._create_rebate,
             ("autopays",): self._create_autopay,
             ("fixedcosts",): self._create_fixed_cost,
             ("snapshots",): lambda data: self._json(take_snapshot(auto=False), 201),  # 手動記錄今天
@@ -944,6 +965,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "fixedcosts": self._update_fixed_cost,
                 "entries": self._update_entry,
                 "trades": self._update_trade,
+                "rebates": self._update_rebate,
             }.get(parts[0])
             if handler:
                 return self._run(lambda: handler(int(parts[1]), self._read_json()))
@@ -974,6 +996,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._run(self._delete_currency, id_)
             if parts[0] == "trades":
                 return self._run(self._delete_trade, id_)
+            if parts[0] == "rebates":
+                with db() as conn:
+                    conn.execute("DELETE FROM rebates WHERE id = ?", (id_,))
+                return self._json({"ok": True})
             if parts[0] == "fixedcosts":
                 with db() as conn:
                     conn.execute("DELETE FROM fixed_costs WHERE id = ?", (id_,))
@@ -1175,6 +1201,7 @@ class Handler(SimpleHTTPRequestHandler):
             if used:
                 raise ValueError(f"這個帳戶還有 {used} 筆交易，請先刪除那些交易才能刪除帳戶")
             traded = conn.execute("SELECT COUNT(*) FROM trades WHERE account_id = ? OR bank_id = ?", (id_, id_)).fetchone()[0]
+            traded += conn.execute("SELECT COUNT(*) FROM rebates WHERE account_id = ? OR bank_id = ?", (id_, id_)).fetchone()[0]
             if traded:
                 raise ValueError(f"這個帳戶還有 {traded} 筆股票交易，請先刪除那些交易才能刪除帳戶")
             held = conn.execute("SELECT COUNT(*) FROM holdings WHERE account_id = ?", (id_,)).fetchone()[0]
@@ -1800,6 +1827,40 @@ class Handler(SimpleHTTPRequestHandler):
                 "UPDATE trades SET date = ?, side = ?, shares = ?, price = ?, fee = ?, tax = ?, amount = ?, note = ? WHERE id = ?",
                 (f["date"], f["side"], f["shares"], f["price"], f["fee"], f["tax"], f["amount"], f["note"], id_))
             recalc_holding(conn, row["holding_id"])
+        self._json({"ok": True})
+
+    # ----- 手續費折讓 -----
+    def _rebate_fields(self, conn, r, account_id=None):
+        account_id = int(account_id or r.get("account_id") or 0)
+        account = conn.execute("SELECT kind FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if not account or account["kind"] != "securities":
+            raise ValueError("折讓款只能記在證券戶")
+        bank = conn.execute("SELECT id, name FROM accounts WHERE kind = 'bank' AND settlement_for = ?", (account_id,)).fetchone()
+        if not bank:
+            raise ValueError("這個證券戶還沒有綁定交割戶，請先到銀行帳戶頁的「證券交割戶」設定")
+        when = text(r.get("date"))[:10]
+        date.fromisoformat(when)
+        currency = text(r.get("currency")) or BASE_CURRENCY
+        self._check_currency(conn, bank["id"], currency, f"交割戶「{bank['name']}」")
+        return {"account_id": account_id, "bank_id": bank["id"], "date": when, "currency": currency,
+                "amount": positive(r.get("amount") or 0, "折讓款"), "note": text(r.get("note"))}
+
+    def _create_rebate(self, r):
+        with db() as conn:
+            f = self._rebate_fields(conn, r)
+            cur = conn.execute(
+                "INSERT INTO rebates (account_id, bank_id, date, amount, currency, note) VALUES (?, ?, ?, ?, ?, ?)",
+                (f["account_id"], f["bank_id"], f["date"], f["amount"], f["currency"], f["note"]))
+        self._json({"id": cur.lastrowid}, 201)
+
+    def _update_rebate(self, id_, r):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM rebates WHERE id = ?", (id_,)).fetchone()
+            if not row:
+                raise ValueError("找不到這筆折讓款")
+            f = self._rebate_fields(conn, {**dict(row), **r}, row["account_id"])
+            conn.execute("UPDATE rebates SET date = ?, amount = ?, currency = ?, note = ? WHERE id = ?",
+                         (f["date"], f["amount"], f["currency"], f["note"], id_))
         self._json({"ok": True})
 
     def _delete_trade(self, id_):
