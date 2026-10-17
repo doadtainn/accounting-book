@@ -290,6 +290,11 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .trade-form .form-group { grid-template-columns: 90px 1fr; }
 .side-btn { cursor: pointer; min-width: 64px; justify-content: center; }
 .btn.static-type { cursor: default; filter: none; }
+.fee-settings { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.fee-settings summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.fee-row { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; }
+.fee-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.fee-field .input-group { width: 150px; }
 /* 固定開銷總表：手機上橫向捲動，不要擠成一字一行 */
 .fixed-table { min-width: 780px; }
 .fixed-table th { white-space: nowrap; }

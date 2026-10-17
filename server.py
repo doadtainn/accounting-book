@@ -378,6 +378,10 @@ def init_db():
         conn.execute(FIXED_COSTS_SQL)
         conn.execute(SNAPSHOTS_SQL)
         conn.execute(TRADES_SQL)
+        account_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
+        if "fee_rate" not in account_cols:  # 證券戶的手續費率（%）、最低手續費、賣出稅費率（%）；NULL＝依幣別預設
+            for col in ("fee_rate", "fee_min", "tax_rate"):
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} REAL")
         holding_cols = {r["name"] for r in conn.execute("PRAGMA table_info(holdings)")}
         if "base_shares" not in holding_cols:  # 期初持股（交易紀錄之前的部位），現有持股全部當期初
             conn.execute("ALTER TABLE holdings ADD COLUMN base_shares REAL NOT NULL DEFAULT 0")
@@ -1088,7 +1092,7 @@ class Handler(SimpleHTTPRequestHandler):
     def _list_accounts(self):
         with db() as conn:
             accounts = [dict(r) for r in conn.execute(
-                "SELECT id, name, kind, sort, settlement_for FROM accounts ORDER BY sort, id"
+                "SELECT id, name, kind, sort, settlement_for, fee_rate, fee_min, tax_rate FROM accounts ORDER BY sort, id"
             )]
             holdings = conn.execute(
                 "SELECT ac.account_id, ac.currency, ac.initial_balance FROM account_currencies ac "
@@ -1124,7 +1128,8 @@ class Handler(SimpleHTTPRequestHandler):
         self._json({"id": id_}, 201)
 
     def _update_account(self, id_, a):
-        """可只改名稱（name）、或只設定交割戶（settlement_for：證券戶 id，null 取消連結）。"""
+        """可只改名稱（name）、只設定交割戶（settlement_for：證券戶 id，null 取消連結），
+        或證券戶的手續費設定（fee_rate、fee_min、tax_rate，空白＝依幣別預設）。"""
         with db() as conn:
             account = conn.execute("SELECT kind FROM accounts WHERE id = ?", (id_,)).fetchone()
             if not account:
@@ -1150,6 +1155,15 @@ class Handler(SimpleHTTPRequestHandler):
                     # 一個證券戶只有一個交割戶：先解除其他銀行對它的連結
                     conn.execute("UPDATE accounts SET settlement_for = NULL WHERE settlement_for = ?", (target,))
                     conn.execute("UPDATE accounts SET settlement_for = ? WHERE id = ?", (target, id_))
+            for col, label, limit in (("fee_rate", "手續費率", 10), ("fee_min", "最低手續費", None), ("tax_rate", "賣出稅費率", 10)):
+                if col not in a:
+                    continue
+                if account["kind"] != "securities":
+                    raise ValueError("手續費設定只能用在證券戶")
+                value = None if a[col] in (None, "") else float(a[col])
+                if value is not None and (value < 0 or (limit and value > limit)):
+                    raise ValueError(f"{label}要在 0～{limit}% 之間" if limit else f"{label}不能是負數")
+                conn.execute(f"UPDATE accounts SET {col} = ? WHERE id = ?", (value, id_))
         self._json({"ok": True})
 
     def _delete_account(self, id_):
