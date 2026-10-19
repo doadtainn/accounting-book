@@ -14,6 +14,7 @@
 ## 執行
 
 - 啟動：`start.bat`（= `python server.py`），port **5000**（環境變數 `LEDGER_PORT` 可改），瀏覽器開 `http://localhost:5000`。需要 **Python 3.11 以上**（樹莓派 Bookworm 是 3.11）：不要用 3.12 才有的語法，例如 f-string 大括號裡用同一種引號。
+- **自架 git 中心＋部署**：正式環境的 `origin` 是伺服器上的裸儲存庫（`~/git/accounting-book.git`），開發機與伺服器的 `~/accounting-book` 都是它的 clone；公開的 GitHub 是另一個 remote `github`。每次修改：`git pull` → 改 → `git commit` → `git push`（再 `git push github main`，推之前先掃描個人資訊）→ `ssh <伺服器> '~/accounting-book/deploy.sh'`（備份到 `backups/deploy/` → `git pull --ff-only origin main` → 重開 `ledger` → 檢查 http）。**不要直接改伺服器上的檔案**，`--ff-only` 會拒絕。
 - Linux／樹莓派：`deploy/raspberry-pi/install.sh` 裝成 systemd 服務 `ledger.service`（`Restart=always`）＋ `ledger-backup.timer`（每天 03:30 `tools/backup.py --keep 30`，`Persistent=true`）；`update.sh` 先備份再 `git pull --ff-only` 並重開。`.gitattributes` 讓 `.sh` 保持 LF。
 - 存取限制（`Handler._allowed`）：只接受私有 IP（本機、區網）與 Tailscale 網段，其他公網 IP 回 403。
 - **記帳本沒有登入功能，不能公開到網際網路**（例如 Tailscale Funnel、路由器轉發）。反向代理進來的連線在伺服器看來是 127.0.0.1，會被放行，所以要公開一定要先做登入驗證。
@@ -52,7 +53,8 @@
 | `tools/icon.html` | App 圖示原始檔；用 Edge 無頭模式截圖產生 PNG（做法寫在檔案開頭） |
 | `tools/test_server.py` | 用資料庫副本在 5001 跑的測試伺服器 |
 | `tools/backup.py` | 備份資料庫：SQLite `backup()` 線上備份（伺服器執行中也安全），存 `backups/ledger-日期時間.db`，保留最新 N 份 |
-| `deploy/raspberry-pi/` | `install.sh`（systemd 服務＋每日備份）、`update.sh`（備份 → git pull → 重開） |
+| `deploy/raspberry-pi/` | `install.sh`（systemd 服務＋每日備份）、`update.sh`（從 GitHub 安裝的人用：備份 → git pull → 重開） |
+| `deploy.sh` | 自架 git 中心的部署腳本（在伺服器上執行：備份 → `git pull --ff-only origin main` → 重開 → 檢查） |
 | `packaging/` | 打包成 Windows 安裝程式（PyInstaller，見「打包」） |
 | `data/ledger.db` | 資料（不進 git，第一次啟動自動建立） |
 
