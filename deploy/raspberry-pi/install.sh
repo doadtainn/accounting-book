@@ -3,7 +3,7 @@
 #   - 開機自動啟動、當掉 5 秒後自動重啟（ledger.service）
 #   - 每天 03:30 自動備份到 backups/，保留 30 份；錯過時間（關機）開機後補做（ledger-backup.timer）
 # 用法：在專案資料夾執行  bash deploy/raspberry-pi/install.sh   （會用 sudo 寫入 systemd 設定）
-# 改連接埠：LEDGER_PORT=5050 bash deploy/raspberry-pi/install.sh
+# 改連接埠（例如 5000 已被其他程式用）：LEDGER_PORT=5050 bash deploy/raspberry-pi/install.sh
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -17,7 +17,12 @@ if [[ -z "$PY" ]]; then
 fi
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "需要 Python 3.11 以上，目前是 " + sys.version.split()[0])'
 
-mkdir -p "$APP_DIR/data" "$APP_DIR/backups"
+# 用 sudo 執行時資料夾也要屬於執行服務的使用者，不然服務寫不進資料庫
+if [[ "$(id -un)" == "$RUN_USER" ]]; then
+  mkdir -p "$APP_DIR/data" "$APP_DIR/backups"
+else
+  sudo -u "$RUN_USER" mkdir -p "$APP_DIR/data" "$APP_DIR/backups"
+fi
 
 sudo tee /etc/systemd/system/ledger.service >/dev/null <<EOF
 [Unit]
