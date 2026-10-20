@@ -1761,13 +1761,22 @@ class Handler(SimpleHTTPRequestHandler):
         when = text(t.get("date"))[:10]
         date.fromisoformat(when)
         shares = positive(t.get("shares") or 0, "股數")
-        price = float(t.get("price") or 0)
+        if shares < 1:
+            raise ValueError("股數最少 1 股")
+        # 成交價金（股數 × 價格）為主；舊的呼叫方式只給 price 也可以。price 由價金 ÷ 股數回推
+        if text(t.get("gross")) != "":
+            gross = float(t.get("gross"))
+            if gross <= 0:
+                raise ValueError("成交價金必須大於 0")
+            price = gross / shares
+        else:
+            price = float(t.get("price") or 0)
+            if price <= 0:
+                raise ValueError("價格必須大於 0")
+            gross = shares * price
         fee, tax = float(t.get("fee") or 0), float(t.get("tax") or 0) if side == "sell" else 0
-        if price <= 0:
-            raise ValueError("價格必須大於 0")
         if fee < 0 or tax < 0:
             raise ValueError("手續費、證交稅不能是負數")
-        gross = shares * price
         amount = gross + fee if side == "buy" else gross - fee - tax
         if amount <= 0:
             raise ValueError("手續費與稅比成交金額還高，請確認金額")

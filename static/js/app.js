@@ -1418,6 +1418,8 @@ function estimateCosts(a, side, gross, code) {
   return { fee, tax: side === "sell" ? cut((gross * f.tax_rate) / 100) : 0 };
 }
 const taxLabel = (code) => (code === BASE ? "證交稅" : "規費");
+// 成交價金（股數 × 價格）；資料表存的是 price，四捨五入到 4 位避免浮點誤差
+const grossOf = (t) => Math.round(t.shares * t.price * 10000) / 10000;
 const realizedBase = (list) => list.filter((t) => t.side === "sell").reduce((s, t) => s + toBase(t.realized, t.currency), 0);
 
 function tradeSection(a, bank) {
@@ -1432,7 +1434,7 @@ function tradeSection(a, bank) {
   const yearTrades = trades.filter((t) => t.date.startsWith(year));
   const holdings = holdingsOf(a.id);
   const editing = trades.find((t) => t.id === state.editTrade);
-  const v = editing ?? { side: "buy", date: today(), shares: "", price: "", fee: "", tax: "", note: "" };
+  const v = editing ? { ...editing, gross: grossOf(editing) } : { side: "buy", date: today(), shares: "", gross: "", fee: "", tax: "", note: "" };
   const hasCost = (k) => editing && v[k] !== "" ? ` data-touched="1"` : "";
 
   // 每月已實現損益（台幣）
@@ -1465,8 +1467,8 @@ function tradeSection(a, bank) {
 
   const list = yearTrades.length
     ? `<div class="table-wrap"><table class="table table-hover trade-list">
-        <thead><tr><th>日期</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">成交價</th>
-          <th class="text-right">手續費＋稅</th><th class="text-right">交割金額</th><th class="text-right">已實現損益</th><th>備註</th><th></th></tr></thead>
+        <thead><tr><th>日期</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">成交價金</th>
+          <th class="text-right">手續費＋稅</th><th class="text-right">交割金額</th><th class="text-right">含費均價</th><th class="text-right">已實現損益</th><th>備註</th><th></th></tr></thead>
         <tbody>${yearTrades.map((t) => {
           const h = state.holdings.find((x) => x.id === t.holding_id);
           return `<tr class="${t.id === state.editTrade ? "row-editing" : ""}">
@@ -1474,9 +1476,10 @@ function tradeSection(a, bank) {
             <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
             <td>${esc(holdingLabel(h))}</td>
             <td class="text-right">${shareText(t.shares)}</td>
-            <td class="text-right amount">${money(t.price, t.currency)}</td>
+            <td class="text-right amount">${money(grossOf(t), t.currency)}</td>
             <td class="text-right amount muted">${money(t.fee + t.tax, t.currency)}</td>
             <td class="text-right">${signedAmount(t.side === "sell" ? t.amount : -t.amount, t.currency)}</td>
+            <td class="text-right amount muted">${money(Math.round((t.amount / t.shares) * 100) / 100, t.currency)}</td>
             <td class="text-right">${t.side === "sell" ? plText(t.realized, t.currency) : `<span class="muted">—</span>`}</td>
             <td class="muted">${esc(t.note) || "—"}</td>
             <td class="text-right nowrap">
@@ -1504,8 +1507,8 @@ function tradeSection(a, bank) {
         <select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, codes[0] ?? BASE)}</select>
       </div></div>
       <div class="form-group"><label for="tr-date">日期</label><input class="form-control" id="tr-date" name="date" type="date" value="${esc(v.date)}" required></div>
-      <div class="form-group"><label for="tr-shares">股數</label><input class="form-control" id="tr-shares" name="shares" type="number" min="0" step="any" inputmode="decimal" value="${v.shares}" required placeholder="一張 = 1000 股"></div>
-      <div class="form-group"><label for="tr-price">成交價</label><input class="form-control" id="tr-price" name="price" type="number" min="0" step="any" inputmode="decimal" value="${v.price}" required></div>
+      <div class="form-group"><label for="tr-shares">股數</label><input class="form-control" id="tr-shares" name="shares" type="number" min="1" step="1" inputmode="numeric" value="${v.shares}" required placeholder="一張 = 1000 股"></div>
+      <div class="form-group"><label for="tr-gross">成交價金</label><input class="form-control" id="tr-gross" name="gross" type="number" min="0" step="any" inputmode="decimal" value="${v.gross}" required placeholder="股數 × 成交價，照成交單填"></div>
       <div class="form-group"><label for="tr-fee">手續費</label><input class="form-control" id="tr-fee" name="fee" type="number" min="0" step="any" inputmode="decimal" value="${v.fee}"${hasCost("fee")}></div>
       <div class="form-group" id="tr-tax-row"${v.side === "sell" ? "" : " hidden"}><label for="tr-tax" id="tr-tax-label">證交稅</label><input class="form-control" id="tr-tax" name="tax" type="number" min="0" step="any" inputmode="decimal" value="${v.tax}"${hasCost("tax")}></div>
       <div class="form-group"><label>交割金額</label><div><strong id="tr-amount">—</strong>
@@ -1598,7 +1601,7 @@ function feeSettingsBox(a) {
   </details>`;
 }
 
-// 交易表單：切換買賣、股票，輸入股數價格時自動估算手續費、稅與交割金額
+// 交易表單：切換買賣、股票，輸入成交價金時自動估算手續費、稅與交割金額
 function bindTradeForm(a) {
   const form = $("[data-trade-form]");
   if (!form) return;
@@ -1615,7 +1618,7 @@ function bindTradeForm(a) {
     f.symbol.required = !$("#tr-new").hidden;
     $("#tr-tax-row").hidden = s !== "sell";
     const code = codeOf();
-    const gross = Number(f.shares.value) * Number(f.price.value);
+    const gross = Number(f.gross.value) || 0;
     const est = estimateCosts(a, s, gross, code);
     const f0 = feeSettings(a);
     $("#tr-tax-label").textContent = tr(taxLabel(code));
@@ -1625,8 +1628,10 @@ function bindTradeForm(a) {
     if (!f.fee.dataset.touched) f.fee.value = gross ? est.fee : "";
     if (!f.tax.dataset.touched) f.tax.value = gross && s === "sell" ? est.tax : "";
     const fee = Number(f.fee.value) || 0, tax = s === "sell" ? Number(f.tax.value) || 0 : 0;
+    const amount = s === "buy" ? gross + fee : gross - fee - tax;
+    const shares = Number(f.shares.value) || 0;
     $("#tr-amount").innerHTML = gross
-      ? `${s === "buy" ? "扣款" : "入帳"} ${money(s === "buy" ? gross + fee : gross - fee - tax, code)}`
+      ? `${s === "buy" ? "扣款" : "入帳"} ${money(amount, code)}${shares >= 1 ? ` <small class="muted">（含費均價 ${money(Math.round((amount / shares) * 100) / 100, code)}）</small>` : ""}`
       : "—";
   };
   form.addEventListener("change", update);
@@ -3324,7 +3329,7 @@ $("#content").addEventListener("submit", (e) => {
     e.preventDefault();
     const side = form.querySelector('input[name="side"]:checked').value;
     const body = {
-      account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value, price: f.price.value,
+      account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value, gross: f.gross.value,
       fee: f.fee.value || 0, tax: side === "sell" ? f.tax.value || 0 : 0, note: f.note.value,
     };
     if (f.holding_id.value) body.holding_id = f.holding_id.value;
