@@ -26,6 +26,7 @@ const MENU = [
   { header: "主選單" },
   { route: "", label: "首頁", icon: "dashboard" },
   { route: "fixed", label: "固定開銷", icon: "repeat" },
+  { route: "invest", label: "固定投資", icon: "stock" },
   { route: "assets", label: "資產變化", icon: "chart" },
   { header: "會計" },
   { route: "calendar", label: "行事曆", icon: "calendar" },
@@ -102,7 +103,7 @@ const shiftMonth = (m, delta) => {
 };
 
 // ===== 資料 =====
-const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], snapshots: [], settings: {}, trades: [], rebates: [], month: today().slice(0, 7), flash: null };
+const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], investments: [], snapshots: [], settings: {}, trades: [], rebates: [], month: today().slice(0, 7), flash: null };
 // 隱私模式：金額顯示成 *****；開關記在這台裝置（手機設了不影響電腦）
 const MASK = "*****";
 state.privacy = (() => {
@@ -322,7 +323,7 @@ async function api(path, opts = {}) {
   return data;
 }
 async function reload() {
-  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades, state.rebates] = await Promise.all([
+  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades, state.rebates, state.investments] = await Promise.all([
     api("/api/entries?month="),
     api("/api/categories"),
     api("/api/accounts"),
@@ -336,6 +337,7 @@ async function reload() {
     api("/api/settings"),
     api("/api/trades"),
     api("/api/rebates"),
+    api("/api/investments"),
   ]);
   tzOffset = Number(state.settings.tz_offset);
 }
@@ -739,6 +741,7 @@ function flowItems(type, view) {
 }
 const FIXED_VIEWS = [["item", "依項目"], ["category", "依分類"]];
 const FLOW_VIEWS = [["category", "依分類"], ["account", "依帳戶"]];
+const INVEST_VIEWS = [["item", "依項目"], ["account", "依證券戶"]];
 
 // 首頁的環形圖：key 用來記住各自的「依類別／依帳戶」選擇
 const DONUTS = {
@@ -756,6 +759,8 @@ const DONUTS = {
     items: (view) => fixedDonutItems(view, false), empty: "沒有月繳的固定開銷" },
   fixedYearly: { title: "年繳佔比", icon: "calendar", cls: "box-danger", center: "年繳合計", views: FIXED_VIEWS,
     items: (view) => fixedDonutItems(view, true), empty: "沒有年繳的固定開銷" },
+  investMonthly: { title: "定期定額佔比", icon: "stock", cls: "box-success", center: "每月投入", views: INVEST_VIEWS,
+    items: investDonutItems, empty: "還沒有啟用中的定期定額" },
   income: { title: "收入分類佔比", icon: "in", cls: "box-success", center: "收入總額", views: FLOW_VIEWS,
     items: (view) => flowItems("income", view), empty: "這個月沒有收入紀錄" },
 };
@@ -2609,6 +2614,151 @@ function fixedPage() {
   };
 }
 
+// ===== 固定投資（定期定額）：只做統計，不會自動記股票交易 =====
+const investDays = (s) => String(s ?? "").split(",").filter(Boolean).map(Number);
+const lastDayOf = (y, m) => new Date(y, m, 0).getDate(); // m 是 1～12
+// 某月的實際扣款日（31 號遇小月取月底）
+const investDates = (days, ym) => {
+  const [y, m] = ym.split("-").map(Number);
+  return [...new Set(days.map((d) => `${ym}-${pad2(Math.min(d, lastDayOf(y, m)))}`))];
+};
+const nextMonth = (ym) => { const [y, m] = ym.split("-").map(Number); return m === 12 ? `${y + 1}-01` : `${y}-${pad2(m + 1)}`; };
+// 今天（含）之後最近的扣款日
+const nextInvestDate = (days) => {
+  const t = today();
+  return [...investDates(days, t.slice(0, 7)), ...investDates(days, nextMonth(t.slice(0, 7)))].find((d) => d >= t);
+};
+
+// m 月份用來算「當月已買進」：同證券戶、同代號持股的買進交易
+function investItems(m = state.month) {
+  return state.investments.map((p) => {
+    const days = investDays(p.days);
+    const account = findAccount(p.account_id);
+    const holding = p.symbol && state.holdings.find((h) => h.account_id === p.account_id && h.symbol.toUpperCase() === p.symbol);
+    const bought = holding ? state.trades.filter((t) => t.holding_id === holding.id && t.side === "buy" && t.date.startsWith(m)) : [];
+    return {
+      ...p, dayList: days, account, holding, times: days.length, label: `${p.symbol} ${p.name}`.trim(),
+      perMonth: p.amount * days.length, monthly: toBase(p.amount * days.length, p.currency),
+      bought: bought.reduce((s, t) => s + t.amount, 0), boughtCount: bought.length, next: nextInvestDate(days),
+    };
+  });
+}
+
+function investDonutItems(view) {
+  const items = investItems().filter((x) => x.active && x.monthly > 0);
+  const subOf = (x) => `每月 ${x.times} 次 × ${money(x.amount, x.currency)}${x.account ? `・${x.account.name}` : ""}`;
+  const itemOf = (x) => ({ name: x.label, value: Math.round(x.monthly), href: x.account && accountHref(x.account), sub: subOf(x) });
+  if (view === "item") return topAccounts(items.map(itemOf), "項");
+  // 依證券戶：順序照帳戶排序
+  const order = accountsOf("securities").map((a) => a.id);
+  const ids = [...new Set(items.map((x) => x.account?.id ?? 0))].sort((x, y) => (order.indexOf(x) + 1 || 99) - (order.indexOf(y) + 1 || 99));
+  return topAccounts(ids.map((id) => {
+    const list = items.filter((x) => (x.account?.id ?? 0) === id);
+    return { name: id ? findAccount(id).name : "（未指定證券戶）", value: list.reduce((s, x) => s + Math.round(x.monthly), 0),
+      detail: () => list.map(itemOf) };
+  }).filter((x) => x.value > 0), "個證券戶");
+}
+
+function investPage() {
+  const all = investItems();
+  const active = all.filter((x) => x.active);
+  const monthly = active.reduce((s, x) => s + Math.round(x.monthly), 0); // 和圓餅圖一樣逐項取整數，合計才一致
+  const times = active.reduce((s, x) => s + x.times, 0);
+  const bought = active.reduce((s, x) => s + toBase(x.bought, x.currency), 0);
+  const boughtCount = active.reduce((s, x) => s + x.boughtCount, 0);
+  const upcoming = active.filter((x) => x.next).sort((x, y) => x.next.localeCompare(y.next));
+  const next = upcoming[0];
+  const nextSame = next ? upcoming.filter((x) => x.next === next.next) : [];
+  const paused = all.length - active.length;
+
+  // 扣款日程（state.month）
+  const schedule = active.flatMap((x) => investDates(x.dayList, state.month).map((d) => ({ date: d, x })))
+    .sort((p, q) => p.date.localeCompare(q.date) || p.x.label.localeCompare(q.x.label));
+  const t = today();
+  const scheduleTable = schedule.length
+    ? `<div class="table-wrap"><table class="table table-hover">
+        <thead><tr><th>日期</th><th>股票</th><th>證券戶</th><th class="text-right">金額</th></tr></thead>
+        <tbody>${schedule.map(({ date, x }) => `<tr class="${date < t ? "row-muted" : ""}">
+          <td class="nowrap">${date}</td><td>${esc(x.label)}</td>
+          <td>${x.account ? `<a href="${accountHref(x.account)}">${esc(x.account.name)}</a>` : `<span class="muted">—</span>`}</td>
+          <td class="text-right amount">${money(x.amount, x.currency)}</td></tr>`).join("")}</tbody>
+      </table></div>`
+    : `<p class="empty">這個月沒有扣款</p>`;
+
+  // 設定表：表格內直接修改（離開欄位自動儲存）
+  const codes = state.currencies.map((c) => c.code);
+  const secOptions = (sel) => accountsOf("securities").map((a) =>
+    `<option value="${a.id}"${a.id === sel ? " selected" : ""}>${esc(a.name)}</option>`).join("");
+  const field = (p, key, cls, attrs = "") =>
+    `<input class="form-control input-sm ${cls}" data-inv-field="${key}" data-inv-id="${p.id}" value="${esc(p[key])}" ${attrs}>`;
+  const table = all.length
+    ? `<div class="table-wrap"><table class="table autopays invest-table">
+        <thead><tr><th>證券戶</th><th>代號</th><th>名稱</th><th>每次金額</th><th>扣款日</th><th class="text-right">每月</th>
+          <th class="text-right">換算台幣</th><th class="text-right nowrap">當月買進</th><th></th></tr></thead>
+        <tbody>${all.map((x) => `<tr class="${x.active ? "" : "row-muted"}">
+          <td><select class="form-control input-sm" data-inv-field="account_id" data-inv-id="${x.id}">
+            <option value="">（不指定）</option>${secOptions(x.account_id)}</select></td>
+          <td>${field(x, "symbol", "w-code")}</td>
+          <td>${field(x, "name", "w-name")}</td>
+          <td class="nowrap"><div class="input-row">
+            <select class="form-control input-sm cur-mini" data-inv-field="currency" data-inv-id="${x.id}" aria-label="幣別">${codes.map((c) =>
+              `<option${c === x.currency ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>
+            ${field(x, "amount", "w-num", 'type="number" min="0.01" step="any" inputmode="decimal"')}</div></td>
+          <td>${field(x, "days", "w-days", 'inputmode="numeric" title="扣款日，例如 6 或 6,16,26"')}</td>
+          <td class="text-right nowrap">${x.times} 次<br><span class="amount muted">${money(x.perMonth, x.currency)}</span></td>
+          <td class="text-right amount">${money(Math.round(x.monthly))}</td>
+          <td class="text-right amount">${x.boughtCount ? `${money(x.bought, x.currency)}<br><small class="muted">${x.boughtCount} 筆</small>` : `<span class="muted">—</span>`}</td>
+          <td class="text-right nowrap">
+            <button class="btn btn-xs btn-default" data-inv-toggle="${x.id}">${x.active ? "暫停" : "啟用"}</button>
+            <button class="btn btn-xs btn-default" data-inv-del="${x.id}" title="刪除">${icon("trash")}</button>
+          </td>
+        </tr>`).join("")}</tbody>
+        <tfoot><tr><td colspan="6"><strong>合計（啟用中）</strong></td><td class="text-right amount"><strong>${money(Math.round(monthly))}</strong></td>
+          <td class="text-right amount">${money(Math.round(bought))}</td><td></td></tr></tfoot>
+      </table></div>`
+    : `<p class="empty">還沒有定期定額</p>`;
+
+  return {
+    title: "固定投資",
+    sub: "每個月定期定額買進的股票",
+    crumbs: ["首頁", "固定投資"],
+    after: () => {
+      bindDonuts();
+      // 新增時選了證券戶，幣別自動帶該帳戶的主要幣別
+      const form = $("[data-add-invest]");
+      form?.account_id.addEventListener("change", () => {
+        const code = accountCodes(findAccount(form.account_id.value))[0];
+        if (code) form.currency.value = code;
+      });
+    },
+    html: `
+      <div class="grid grid-4">
+        ${infoBox("green", "stock", "每月投入合計", money(Math.round(monthly)), `${active.length} 項・每月 ${times} 次${paused ? `・另有 ${paused} 項暫停中` : ""}`)}
+        ${infoBox("aqua", "calendar", "每年投入合計", money(Math.round(monthly * 12)), "每月合計 × 12")}
+        ${infoBox("yellow", "chart", `${monthLabel(state.month)}已買進`, money(Math.round(bought)), `${boughtCount} 筆股票交易`)}
+        ${infoBox("purple", "repeat", "下次扣款", next ? next.next : "—",
+          next ? esc(nextSame.map((x) => x.label).join("、")) : "沒有啟用中的定期定額")}
+      </div>
+      <div class="grid grid-2">
+        ${donutBox("investMonthly", `<span class="muted hint-inline">每月投入金額（換算台幣）</span>`)}
+        ${box(`${icon("calendar")} 扣款日程`, scheduleTable, { cls: "box-info", flush: true, tools: monthNav() })}
+      </div>
+      ${box(`${icon("list")} 定期定額設定`, table, {
+        cls: "box-success", flush: true,
+        footer: `<form class="inline-form" data-add-invest>
+            <select class="form-control" name="account_id" aria-label="證券戶"><option value="">（不指定證券戶）</option>${secOptions(null)}</select>
+            <input class="form-control" name="symbol" placeholder="代號，例如 0050">
+            <input class="form-control" name="name" placeholder="名稱（留空自動抓）">
+            <select class="form-control cur-mini" name="currency" aria-label="幣別">${codes.map((c) => `<option>${esc(c)}</option>`).join("")}</select>
+            <input class="form-control num-input" name="amount" type="number" min="0.01" step="any" inputmode="decimal" placeholder="每次金額" required>
+            <input class="form-control" name="days" inputmode="numeric" placeholder="扣款日，例如 6,16,26" required>
+            <button class="btn btn-default" type="submit">${icon("plus")} 新增</button>
+          </form>
+          <p class="muted hint">扣款日填幾個日期就是一個月扣幾次（每月 6 號填 6；每月 6、16、26 號填 6,16,26），31 號遇小月算月底。這裡只做統計，不會自動記股票交易；扣款後請到證券戶頁「記錄股票交易」，「當月買進」會對照同證券戶、同代號的買進紀錄。</p>`,
+      })}`,
+  };
+}
+
 // ===== 資產變化：伺服器每天 17:00 記錄的資產快照 =====
 // 顏色依固定順序（series-1～4），跟著項目走
 const SNAP_SERIES = [
@@ -2850,6 +3000,7 @@ const PAGES = {
   new: newPage,
   edit: editPage,
   fixed: fixedPage,
+  invest: investPage,
   assets: assetsPage,
   prefs: prefsPage,
   calendar: calendarPage,
@@ -2947,6 +3098,17 @@ $("#content").addEventListener("click", async (e) => {
     return;
   }
 
+  const invToggle = e.target.closest("[data-inv-toggle]");
+  if (invToggle) {
+    const p = state.investments.find((x) => x.id === Number(invToggle.dataset.invToggle));
+    return mutate(() => putJson(`/api/investments/${p.id}`, { active: !p.active }));
+  }
+  const invDel = e.target.closest("[data-inv-del]");
+  if (invDel) {
+    const p = state.investments.find((x) => x.id === Number(invDel.dataset.invDel));
+    if (confirm(`刪除定期定額「${`${p.symbol} ${p.name}`.trim()}」？`)) return mutate(() => api(`/api/investments/${p.id}`, { method: "DELETE" }));
+    return;
+  }
   const fcToggle = e.target.closest("[data-fc-toggle]");
   if (fcToggle) {
     const fc = state.fixedcosts.find((x) => x.id === Number(fcToggle.dataset.fcToggle));
@@ -3264,6 +3426,8 @@ $("#content").addEventListener("change", (e) => {
       state.flash = ["success", "已儲存手續費設定"];
     }, () => { const d = $(".fee-settings"); if (d) d.open = true; });
   }
+  const inv = e.target.closest("[data-inv-field]");
+  if (inv) return mutate(() => putJson(`/api/investments/${inv.dataset.invId}`, { [inv.dataset.invField]: inv.value }));
   const fc = e.target.closest("[data-fc-field]");
   if (fc) {
     const key = fc.dataset.fcField;
@@ -3342,6 +3506,17 @@ $("#content").addEventListener("submit", (e) => {
       state.flash = ["success", editingId ? "已修改股票交易，持股與損益已重新計算"
         : side === "sell" ? `已記錄賣出，已實現損益 ${t.realized >= 0 ? "+" : ""}${money(t.realized, t.currency)}`
         : `已記錄買進，交割戶扣款 ${money(t.amount, t.currency)}`];
+    });
+  }
+
+  if (form.matches("[data-add-invest]")) {
+    e.preventDefault();
+    return mutate(async () => {
+      const r = await postJson("/api/investments", {
+        account_id: f.account_id.value || null, symbol: f.symbol.value, name: f.name.value,
+        currency: f.currency.value, amount: f.amount.value, days: f.days.value,
+      });
+      state.flash = ["success", `已新增定期定額「${`${f.symbol.value.trim().toUpperCase()} ${r.name}`.trim()}」`];
     });
   }
 

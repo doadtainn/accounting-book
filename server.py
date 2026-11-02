@@ -271,6 +271,20 @@ FIXED_COSTS_SQL = """CREATE TABLE IF NOT EXISTS fixed_costs (
     note TEXT NOT NULL DEFAULT '',
     sort INTEGER NOT NULL DEFAULT 0
 )"""
+# 固定投資（定期定額）：每個月固定日期買哪檔股票、每次多少；只用來統計，不會自動記股票交易
+# days 是扣款日，逗號分隔（例如 "6,16,26"），幾個日期就是一個月扣幾次；account_id（證券戶）可不填
+INVESTMENTS_SQL = """CREATE TABLE IF NOT EXISTS investments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER,
+    symbol TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL DEFAULT 'TWD',
+    amount REAL NOT NULL CHECK (amount > 0),
+    days TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    note TEXT NOT NULL DEFAULT '',
+    sort INTEGER NOT NULL DEFAULT 0
+)"""
 _autopay_lock = threading.Lock()  # 同時多個請求時避免重複自動記帳
 
 # 保障型保單的保費支出分類
@@ -389,6 +403,7 @@ def init_db():
         conn.execute(POLICIES_SQL)
         conn.execute(AUTOPAYS_SQL)
         conn.execute(FIXED_COSTS_SQL)
+        conn.execute(INVESTMENTS_SQL)
         conn.execute(SNAPSHOTS_SQL)
         conn.execute(TRADES_SQL)
         conn.execute(REBATES_SQL)
@@ -888,6 +903,10 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 rows = conn.execute("SELECT * FROM fixed_costs ORDER BY sort, id").fetchall()
             return self._json([dict(r) for r in rows])
+        if url.path == "/api/investments":
+            with db() as conn:
+                rows = conn.execute("SELECT * FROM investments ORDER BY sort, id").fetchall()
+            return self._json([dict(r) for r in rows])
         if url.path == "/api/policies":
             with db() as conn:
                 rows = conn.execute("SELECT * FROM policies").fetchall()
@@ -920,6 +939,7 @@ class Handler(SimpleHTTPRequestHandler):
             ("rebates",): self._create_rebate,
             ("autopays",): self._create_autopay,
             ("fixedcosts",): self._create_fixed_cost,
+            ("investments",): self._create_investment,
             ("snapshots",): lambda data: self._json(take_snapshot(auto=False), 201),  # 手動記錄今天
         }
         if parts and tuple(parts) in handlers:
@@ -949,7 +969,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         parts = self._parts() or []
         # 拖曳排序：PUT /api/<accounts|categories|currencies>/order，內容 {"ids": [依新順序排列的 id]}
-        if len(parts) == 2 and parts[1] == "order" and parts[0] in ("accounts", "categories", "currencies", "holdings", "autopays", "fixedcosts"):
+        if len(parts) == 2 and parts[1] == "order" and parts[0] in ("accounts", "categories", "currencies", "holdings", "autopays", "fixedcosts", "investments"):
             table = "fixed_costs" if parts[0] == "fixedcosts" else parts[0]
             return self._run(lambda: self._reorder(table, self._read_json()))
         if parts == ["settings"]:
@@ -964,6 +984,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "policies": self._save_policy,
                 "autopays": self._update_autopay,
                 "fixedcosts": self._update_fixed_cost,
+                "investments": self._update_investment,
                 "entries": self._update_entry,
                 "trades": self._update_trade,
                 "rebates": self._update_rebate,
@@ -1004,6 +1025,10 @@ class Handler(SimpleHTTPRequestHandler):
             if parts[0] == "fixedcosts":
                 with db() as conn:
                     conn.execute("DELETE FROM fixed_costs WHERE id = ?", (id_,))
+                return self._json({"ok": True})
+            if parts[0] == "investments":
+                with db() as conn:
+                    conn.execute("DELETE FROM investments WHERE id = ?", (id_,))
                 return self._json({"ok": True})
             if parts[0] == "autopays":  # 已記的帳保留
                 with db() as conn:
@@ -1214,6 +1239,7 @@ class Handler(SimpleHTTPRequestHandler):
             conn.execute("DELETE FROM policies WHERE account_id = ?", (id_,))
             conn.execute("DELETE FROM autopays WHERE account_id = ?", (id_,))
             conn.execute("UPDATE fixed_costs SET account_id = NULL WHERE account_id = ?", (id_,))
+            conn.execute("UPDATE investments SET account_id = NULL WHERE account_id = ?", (id_,))
             conn.execute("DELETE FROM accounts WHERE id = ?", (id_,))
         self._json({"ok": True})
 
@@ -1379,6 +1405,68 @@ class Handler(SimpleHTTPRequestHandler):
                 "account_id = ?, active = ?, note = ? WHERE id = ?",
                 (f["name"], f["amount"], f["currency"], f["frequency"], f["category"], f["subcategory"],
                  f["account_id"], f["active"], f["note"], id_),
+            )
+        self._json({"ok": True})
+
+    # ----- 固定投資（定期定額） -----
+    @staticmethod
+    def _investment_fields(a):
+        symbol, name = text(a.get("symbol")).upper(), text(a.get("name"))
+        if not symbol and not name:
+            raise ValueError("請填股票代號或名稱，例如 0050")
+        try:
+            days = sorted({int(d) for d in re.split(r"[,，、\s]+", text(a.get("days"))) if d})
+        except ValueError:
+            days = []
+        if not days or any(d < 1 or d > 31 for d in days):
+            raise ValueError("扣款日請填 1～31 的日期，例如 6 或 6,16,26")
+        account_id = a.get("account_id")
+        return {
+            "account_id": int(account_id) if account_id not in (None, "", 0, "0") else None,
+            "symbol": symbol, "name": name, "currency": text(a.get("currency")) or BASE_CURRENCY,
+            "amount": positive(a.get("amount") or 0, "每次金額"), "days": ",".join(map(str, days)),
+            "active": 0 if a.get("active") in (False, 0, "0", "false") else 1, "note": text(a.get("note")),
+        }
+
+    @staticmethod
+    def _fill_investment(conn, f):
+        """檢查證券戶；名稱留空時用持股的名稱，沒有就查台股中文名稱（快取，需在交易外先下載）。"""
+        if f["account_id"] is not None:
+            row = conn.execute("SELECT kind FROM accounts WHERE id = ?", (f["account_id"],)).fetchone()
+            if not row or row["kind"] != "securities":
+                raise ValueError("請選擇證券戶")
+        if not f["name"] and f["symbol"]:
+            held = conn.execute("SELECT name FROM holdings WHERE UPPER(symbol) = ? AND name != '' LIMIT 1", (f["symbol"],)).fetchone()
+            if held:
+                f["name"] = held["name"]
+            elif f["currency"] == BASE_CURRENCY:
+                f["name"] = (_tw_names["names"] or {}).get(f["symbol"], "")
+
+    def _create_investment(self, a):
+        f = self._investment_fields(a)
+        if not f["name"] and f["currency"] == BASE_CURRENCY:
+            tw_stock_names()  # 先在交易外下載中文股名（有快取）
+        with db() as conn:
+            self._fill_investment(conn, f)
+            sort = conn.execute("SELECT COALESCE(MAX(sort), 0) + 1 FROM investments").fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO investments (account_id, symbol, name, currency, amount, days, active, note, sort) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f["account_id"], f["symbol"], f["name"], f["currency"], f["amount"], f["days"], f["active"], f["note"], sort),
+            )
+        self._json({"id": cur.lastrowid, "name": f["name"]}, 201)
+
+    def _update_investment(self, id_, a):
+        with db() as conn:
+            row = conn.execute("SELECT * FROM investments WHERE id = ?", (id_,)).fetchone()
+            if not row:
+                raise ValueError("找不到這個定期定額")
+            f = self._investment_fields({**dict(row), **a})
+            self._fill_investment(conn, f)
+            conn.execute(
+                "UPDATE investments SET account_id = ?, symbol = ?, name = ?, currency = ?, amount = ?, days = ?, active = ?, note = ? "
+                "WHERE id = ?",
+                (f["account_id"], f["symbol"], f["name"], f["currency"], f["amount"], f["days"], f["active"], f["note"], id_),
             )
         self._json({"ok": True})
 

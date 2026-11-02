@@ -280,6 +280,9 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .autopays .w-name { min-width: 110px; }
 .autopays .w-day { width: 64px; display: inline-block; text-align: right; }
 .autopays .w-num { width: 110px; text-align: right; }
+.invest-table .w-code { width: 90px; }
+.invest-table .w-days { width: 110px; }
+.invest-table select[data-inv-field="account_id"] { min-width: 120px; }
 .row-muted td { opacity: .5; }
 /* 股票交易 */
 .tag-buy { color: var(--stock-up); border-color: var(--stock-up); }
