@@ -1479,7 +1479,7 @@ function tradeSection(a, bank) {
           return `<tr class="${t.id === state.editTrade ? "row-editing" : ""}">
             <td class="nowrap">${t.date}</td>
             <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
-            <td>${esc(holdingLabel(h))}</td>
+            <td>${esc(holdingLabel(h))}${t.investment_id ? ` <span class="code-tag tag-dca">定期定額</span>` : ""}</td>
             <td class="text-right">${shareText(t.shares)}</td>
             <td class="text-right amount">${money(grossOf(t), t.currency)}</td>
             <td class="text-right amount muted">${money(t.fee + t.tax, t.currency)}</td>
@@ -1496,13 +1496,19 @@ function tradeSection(a, bank) {
     : `<p class="empty">${year} 年沒有股票交易</p>`;
 
   const codes = accountCodes(bank);
-  const holdingOptions = holdings.map((h) => `<option value="${h.id}" data-currency="${esc(h.currency)}"${editing && editing.holding_id === h.id ? " selected" : ""}>
+  // 這個證券戶（或沒指定證券戶）的定期定額；暫停的只在修改原本就標記它的交易時列出
+  const plans = state.investments.filter((p) => (p.account_id === a.id || p.account_id == null) && (p.active || editing?.investment_id === p.id));
+  const holdingOptions = holdings.map((h) => `<option value="${h.id}" data-currency="${esc(h.currency)}" data-symbol="${esc(h.symbol.toUpperCase())}"${editing && editing.holding_id === h.id ? " selected" : ""}>
     ${esc(holdingLabel(h))}（持有 ${shareText(h.shares)} 股）</option>`).join("");
   const form = `<form class="trade-form" data-trade-form="${a.id}" autocomplete="off">
       <div class="form-group"><label>買賣</label><div class="btn-group" role="radiogroup">
         ${Object.entries(SIDES).map(([k, s]) => `<label class="btn btn-sm ${v.side === k ? (k === "buy" ? "btn-danger" : "btn-success") : "btn-default"} side-btn">
           <input type="radio" name="side" value="${k}"${v.side === k ? " checked" : ""} hidden>${s.name}</label>`).join("")}
       </div></div>
+      ${plans.length ? `<div class="form-group" id="tr-inv-row"${v.side === "buy" ? "" : " hidden"}><label for="tr-inv">定期定額</label>
+        <select class="form-control" id="tr-inv" name="investment_id"><option value="">（不是定期定額）</option>
+          ${plans.map((p) => `<option value="${p.id}" data-symbol="${esc(p.symbol)}" data-currency="${esc(p.currency)}"${editing?.investment_id === p.id ? " selected" : ""}>
+            ${esc(`${p.symbol} ${p.name}`.trim())}（每次 ${money(p.amount, p.currency)}・每月 ${esc(p.days)} 號）</option>`).join("")}</select></div>` : ""}
       <div class="form-group"><label for="tr-holding">股票</label><div class="input-row">
         <select class="form-control" id="tr-holding" name="holding_id"${editing ? " disabled" : ""}>${holdingOptions}
           ${editing ? "" : `<option value="">＋ 其他股票（輸入代號）</option>`}</select>
@@ -1619,6 +1625,7 @@ function bindTradeForm(a) {
       const on = b.querySelector("input").checked;
       b.className = `btn btn-sm side-btn ${on ? (b.querySelector("input").value === "buy" ? "btn-danger" : "btn-success") : "btn-default"}`;
     });
+    if ($("#tr-inv-row")) $("#tr-inv-row").hidden = s !== "buy";
     $("#tr-new").hidden = Boolean(f.holding_id.value) || f.holding_id.disabled;
     f.symbol.required = !$("#tr-new").hidden;
     $("#tr-tax-row").hidden = s !== "sell";
@@ -1639,6 +1646,18 @@ function bindTradeForm(a) {
       ? `${s === "buy" ? "扣款" : "入帳"} ${money(amount, code)}${shares >= 1 ? ` <small class="muted">（含費均價 ${money(Math.round((amount / shares) * 100) / 100, code)}）</small>` : ""}`
       : "—";
   };
+  // 選了定期定額：股票自動切到同代號的持股，還沒持有就改成「其他股票」並填入代號
+  f.investment_id?.addEventListener("change", () => {
+    const opt = f.investment_id.selectedOptions[0];
+    if (!f.investment_id.value || f.holding_id.disabled || !opt.dataset.symbol) return;
+    const held = [...f.holding_id.options].find((o) => o.value && o.dataset.symbol === opt.dataset.symbol);
+    if (held) f.holding_id.value = held.value;
+    else {
+      f.holding_id.value = "";
+      f.symbol.value = opt.dataset.symbol;
+      if ([...f.currency.options].some((o) => o.value === opt.dataset.currency)) f.currency.value = opt.dataset.currency;
+    }
+  });
   form.addEventListener("change", update);
   form.addEventListener("input", (e) => {
     if (e.target === f.fee || e.target === f.tax) e.target.dataset.touched = "1";
@@ -2629,15 +2648,14 @@ const nextInvestDate = (days) => {
   return [...investDates(days, t.slice(0, 7)), ...investDates(days, nextMonth(t.slice(0, 7)))].find((d) => d >= t);
 };
 
-// m 月份用來算「當月已買進」：同證券戶、同代號持股的買進交易
+// m 月份用來算「當月買進」：記錄股票交易時標記為這個定期定額的買進（金額用實際交割金額）
 function investItems(m = state.month) {
   return state.investments.map((p) => {
     const days = investDays(p.days);
     const account = findAccount(p.account_id);
-    const holding = p.symbol && state.holdings.find((h) => h.account_id === p.account_id && h.symbol.toUpperCase() === p.symbol);
-    const bought = holding ? state.trades.filter((t) => t.holding_id === holding.id && t.side === "buy" && t.date.startsWith(m)) : [];
+    const bought = state.trades.filter((t) => t.investment_id === p.id && t.side === "buy" && t.date.startsWith(m));
     return {
-      ...p, dayList: days, account, holding, times: days.length, label: `${p.symbol} ${p.name}`.trim(),
+      ...p, dayList: days, account, times: days.length, label: `${p.symbol} ${p.name}`.trim(),
       perMonth: p.amount * days.length, monthly: toBase(p.amount * days.length, p.currency),
       bought: bought.reduce((s, t) => s + t.amount, 0), boughtCount: bought.length, next: nextInvestDate(days),
     };
@@ -2707,7 +2725,7 @@ function investPage() {
           <td>${field(x, "days", "w-days", 'inputmode="numeric" title="扣款日，例如 6 或 6,16,26"')}</td>
           <td class="text-right nowrap">${x.times} 次<br><span class="amount muted">${money(x.perMonth, x.currency)}</span></td>
           <td class="text-right amount">${money(Math.round(x.monthly))}</td>
-          <td class="text-right amount">${x.boughtCount ? `${money(x.bought, x.currency)}<br><small class="muted">${x.boughtCount} 筆</small>` : `<span class="muted">—</span>`}</td>
+          <td class="text-right amount nowrap">${x.boughtCount ? money(x.bought, x.currency) : `<span class="muted">—</span>`}<br><small class="muted">已扣 ${x.boughtCount}／${x.times} 次</small></td>
           <td class="text-right nowrap">
             <button class="btn btn-xs btn-default" data-inv-toggle="${x.id}">${x.active ? "暫停" : "啟用"}</button>
             <button class="btn btn-xs btn-default" data-inv-del="${x.id}" title="刪除">${icon("trash")}</button>
@@ -2754,7 +2772,7 @@ function investPage() {
             <input class="form-control" name="days" inputmode="numeric" placeholder="扣款日，例如 6,16,26" required>
             <button class="btn btn-default" type="submit">${icon("plus")} 新增</button>
           </form>
-          <p class="muted hint">扣款日填幾個日期就是一個月扣幾次（每月 6 號填 6；每月 6、16、26 號填 6,16,26），31 號遇小月算月底。這裡只做統計，不會自動記股票交易；扣款後請到證券戶頁「記錄股票交易」，「當月買進」會對照同證券戶、同代號的買進紀錄。</p>`,
+          <p class="muted hint">扣款日填幾個日期就是一個月扣幾次（每月 6 號填 6；每月 6、16、26 號填 6,16,26），31 號遇小月算月底。這裡只做統計，不會自動記股票交易；扣款後請到證券戶頁「記錄股票交易」並選擇「定期定額」，「當月買進」就會列入（金額照實際交割金額）。</p>`,
       })}`,
   };
 }
@@ -3495,6 +3513,7 @@ $("#content").addEventListener("submit", (e) => {
     const body = {
       account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value, gross: f.gross.value,
       fee: f.fee.value || 0, tax: side === "sell" ? f.tax.value || 0 : 0, note: f.note.value,
+      investment_id: side === "buy" ? f.investment_id?.value || null : null,
     };
     if (f.holding_id.value) body.holding_id = f.holding_id.value;
     else Object.assign(body, { symbol: f.symbol.value, currency: f.currency.value });

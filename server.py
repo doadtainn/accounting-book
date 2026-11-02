@@ -407,6 +407,8 @@ def init_db():
         conn.execute(SNAPSHOTS_SQL)
         conn.execute(TRADES_SQL)
         conn.execute(REBATES_SQL)
+        if "investment_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}:
+            conn.execute("ALTER TABLE trades ADD COLUMN investment_id INTEGER")  # 這筆買進屬於哪個定期定額（NULL＝一般交易）
         account_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
         if "fee_rate" not in account_cols:  # 證券戶的手續費率（%）、最低手續費、賣出稅費率（%）；NULL＝依幣別預設
             for col in ("fee_rate", "fee_min", "tax_rate"):
@@ -1026,8 +1028,9 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn:
                     conn.execute("DELETE FROM fixed_costs WHERE id = ?", (id_,))
                 return self._json({"ok": True})
-            if parts[0] == "investments":
+            if parts[0] == "investments":  # 已記的股票交易保留，只是不再標記為定期定額
                 with db() as conn:
+                    conn.execute("UPDATE trades SET investment_id = NULL WHERE investment_id = ?", (id_,))
                     conn.execute("DELETE FROM investments WHERE id = ?", (id_,))
                 return self._json({"ok": True})
             if parts[0] == "autopays":  # 已記的帳保留
@@ -1868,7 +1871,17 @@ class Handler(SimpleHTTPRequestHandler):
         amount = gross + fee if side == "buy" else gross - fee - tax
         if amount <= 0:
             raise ValueError("手續費與稅比成交金額還高，請確認金額")
+        # 定期定額：只有買進可以標記，且必須是這個證券戶（或沒指定證券戶）的定期定額
+        investment_id = t.get("investment_id")
+        investment_id = int(investment_id) if side == "buy" and investment_id not in (None, "", 0, "0") else None
+        if investment_id is not None:
+            plan = conn.execute("SELECT account_id FROM investments WHERE id = ?", (investment_id,)).fetchone()
+            if not plan:
+                raise ValueError("找不到這個定期定額")
+            if plan["account_id"] not in (None, account_id):
+                raise ValueError("這個定期定額屬於其他證券戶")
         return {"account_id": account_id, "bank_id": bank["id"], "bank_name": bank["name"], "side": side, "date": when,
+                "investment_id": investment_id,
                 "shares": shares, "price": price, "fee": round(fee, 4), "tax": round(tax, 4),
                 "amount": round(amount, 4), "note": text(t.get("note"))}
 
@@ -1907,10 +1920,10 @@ class Handler(SimpleHTTPRequestHandler):
             h = self._trade_holding(conn, t, f)
             self._check_currency(conn, f["bank_id"], h["currency"], f"交割戶「{f['bank_name']}」")
             cur = conn.execute(
-                "INSERT INTO trades (account_id, holding_id, bank_id, date, side, shares, price, fee, tax, amount, currency, note) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO trades (account_id, holding_id, bank_id, date, side, shares, price, fee, tax, amount, currency, note, "
+                "investment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (f["account_id"], h["id"], f["bank_id"], f["date"], f["side"], f["shares"], f["price"], f["fee"],
-                 f["tax"], f["amount"], h["currency"], f["note"]))
+                 f["tax"], f["amount"], h["currency"], f["note"], f["investment_id"]))
             recalc_holding(conn, h["id"])  # 賣超過持股會丟錯，整筆不寫入
             row = conn.execute("SELECT * FROM trades WHERE id = ?", (cur.lastrowid,)).fetchone()
         self._json(dict(row), 201)
@@ -1922,8 +1935,9 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("找不到這筆股票交易")
             f = self._trade_fields(conn, {**dict(row), **t}, row["account_id"])
             conn.execute(
-                "UPDATE trades SET date = ?, side = ?, shares = ?, price = ?, fee = ?, tax = ?, amount = ?, note = ? WHERE id = ?",
-                (f["date"], f["side"], f["shares"], f["price"], f["fee"], f["tax"], f["amount"], f["note"], id_))
+                "UPDATE trades SET date = ?, side = ?, shares = ?, price = ?, fee = ?, tax = ?, amount = ?, note = ?, investment_id = ? "
+                "WHERE id = ?",
+                (f["date"], f["side"], f["shares"], f["price"], f["fee"], f["tax"], f["amount"], f["note"], f["investment_id"], id_))
             recalc_holding(conn, row["holding_id"])
         self._json({"ok": True})
 
