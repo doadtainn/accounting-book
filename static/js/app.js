@@ -1406,25 +1406,6 @@ const SIDES = { buy: { name: "買進", cls: "tag-buy" }, sell: { name: "賣出",
 const tradesOf = (accountId) => state.trades.filter((t) => t.account_id === accountId);
 const shareText = (n) => (state.privacy ? MASK : Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 4 }));
 const holdingLabel = (h) => (h ? `${h.symbol} ${h.name}`.trim() : "（已刪除的股票）");
-// 手續費設定：每個證券戶自己設（accounts.fee_rate／fee_min／tax_rate），沒設就依帳戶主要幣別的預設
-// 台股：手續費 0.1425%（最低 20 元）、賣出證交稅 0.3%；外幣（例如美股免佣券商）預設全部 0
-const FEE_DEFAULTS = { [BASE]: { fee_rate: 0.1425, fee_min: 20, tax_rate: 0.3 } };
-const ZERO_FEES = { fee_rate: 0, fee_min: 0, tax_rate: 0 };
-function feeSettings(a) {
-  const d = FEE_DEFAULTS[accountCodes(a)[0]] ?? ZERO_FEES;
-  return { fee_rate: a.fee_rate ?? d.fee_rate, fee_min: a.fee_min ?? d.fee_min, tax_rate: a.tax_rate ?? d.tax_rate };
-}
-// 台幣無條件捨去到整數；外幣四捨五入到小數 2 位
-function estimateCosts(a, side, gross, code) {
-  if (!gross) return { fee: 0, tax: 0 };
-  const f = feeSettings(a);
-  const cut = (n) => (code === BASE ? Math.floor(n) : Math.round(n * 100) / 100);
-  const fee = f.fee_rate || f.fee_min ? Math.max(f.fee_min, cut((gross * f.fee_rate) / 100)) : 0;
-  return { fee, tax: side === "sell" ? cut((gross * f.tax_rate) / 100) : 0 };
-}
-const taxLabel = (code) => (code === BASE ? "證交稅" : "規費");
-// 成交價金（股數 × 價格）；資料表存的是 price，四捨五入到 4 位避免浮點誤差
-const grossOf = (t) => Math.round(t.shares * t.price * 10000) / 10000;
 const realizedBase = (list) => list.filter((t) => t.side === "sell").reduce((s, t) => s + toBase(t.realized, t.currency), 0);
 
 function tradeSection(a, bank) {
@@ -1439,8 +1420,7 @@ function tradeSection(a, bank) {
   const yearTrades = trades.filter((t) => t.date.startsWith(year));
   const holdings = holdingsOf(a.id);
   const editing = trades.find((t) => t.id === state.editTrade);
-  const v = editing ? { ...editing, gross: grossOf(editing) } : { side: "buy", date: today(), shares: "", gross: "", fee: "", tax: "", note: "" };
-  const hasCost = (k) => editing && v[k] !== "" ? ` data-touched="1"` : "";
+  const v = editing ?? { side: "buy", date: today(), shares: "", amount: "", note: "" };
 
   // 每月已實現損益（台幣）
   const rebates = rebatesOf(a.id);
@@ -1472,8 +1452,8 @@ function tradeSection(a, bank) {
 
   const list = yearTrades.length
     ? `<div class="table-wrap"><table class="table table-hover trade-list">
-        <thead><tr><th>日期</th><th>買賣</th><th>股票</th><th class="text-right">股數</th><th class="text-right">成交價金</th>
-          <th class="text-right">手續費＋稅</th><th class="text-right">交割金額</th><th class="text-right">含費均價</th><th class="text-right">已實現損益</th><th>備註</th><th></th></tr></thead>
+        <thead><tr><th>日期</th><th>買賣</th><th>股票</th><th class="text-right">股數</th>
+          <th class="text-right">交割金額</th><th class="text-right">含費均價</th><th class="text-right">已實現損益</th><th>備註</th><th></th></tr></thead>
         <tbody>${yearTrades.map((t) => {
           const h = state.holdings.find((x) => x.id === t.holding_id);
           return `<tr class="${t.id === state.editTrade ? "row-editing" : ""}">
@@ -1481,8 +1461,6 @@ function tradeSection(a, bank) {
             <td><span class="code-tag ${SIDES[t.side].cls}">${SIDES[t.side].name}</span></td>
             <td>${esc(holdingLabel(h))}${t.investment_id ? ` <span class="code-tag tag-dca">定期定額</span>` : ""}</td>
             <td class="text-right">${shareText(t.shares)}</td>
-            <td class="text-right amount">${money(grossOf(t), t.currency)}</td>
-            <td class="text-right amount muted">${money(t.fee + t.tax, t.currency)}</td>
             <td class="text-right">${signedAmount(t.side === "sell" ? t.amount : -t.amount, t.currency)}</td>
             <td class="text-right amount muted">${money(Math.round((t.amount / t.shares) * 100) / 100, t.currency)}</td>
             <td class="text-right">${t.side === "sell" ? plText(t.realized, t.currency) : `<span class="muted">—</span>`}</td>
@@ -1519,10 +1497,8 @@ function tradeSection(a, bank) {
       </div></div>
       <div class="form-group"><label for="tr-date">日期</label><input class="form-control" id="tr-date" name="date" type="date" value="${esc(v.date)}" required></div>
       <div class="form-group"><label for="tr-shares">股數</label><input class="form-control" id="tr-shares" name="shares" type="number" min="1" step="1" inputmode="numeric" value="${v.shares}" required placeholder="一張 = 1000 股"></div>
-      <div class="form-group"><label for="tr-gross">成交價金</label><input class="form-control" id="tr-gross" name="gross" type="number" min="0" step="any" inputmode="decimal" value="${v.gross}" required placeholder="股數 × 成交價，照成交單填"></div>
-      <div class="form-group"><label for="tr-fee">手續費</label><input class="form-control" id="tr-fee" name="fee" type="number" min="0" step="any" inputmode="decimal" value="${v.fee}"${hasCost("fee")}></div>
-      <div class="form-group" id="tr-tax-row"${v.side === "sell" ? "" : " hidden"}><label for="tr-tax" id="tr-tax-label">證交稅</label><input class="form-control" id="tr-tax" name="tax" type="number" min="0" step="any" inputmode="decimal" value="${v.tax}"${hasCost("tax")}></div>
-      <div class="form-group"><label>交割金額</label><div><strong id="tr-amount">—</strong>
+      <div class="form-group"><label for="tr-amount-in">交割金額</label><div>
+        <input class="form-control" id="tr-amount-in" name="amount" type="number" min="0.01" step="any" inputmode="decimal" value="${v.amount}" required placeholder="照成交單填，已含手續費與稅">
         <p class="muted hint" id="tr-hint"></p></div></div>
       <div class="form-group"><label for="tr-note">備註</label><input class="form-control" id="tr-note" name="note" value="${esc(v.note)}" placeholder="選填"></div>
       <div class="box-footer-row">
@@ -1545,7 +1521,7 @@ function tradeSection(a, bank) {
         `累計 ${money(Math.round(rebateBase(rebates)))}`)}
     </div>
     <div class="grid grid-2">
-      ${box(`${icon(editing ? "edit" : "plus")} ${editing ? "修改股票交易" : "記錄股票交易"}`, form + feeSettingsBox(a), { cls: editing ? "box-warning" : "box-primary" })}
+      ${box(`${icon(editing ? "edit" : "plus")} ${editing ? "修改股票交易" : "記錄股票交易"}`, form, { cls: editing ? "box-warning" : "box-primary" })}
       ${box(`${icon("chart")} 每月已實現損益`, monthTable, { cls: "box-default", flush: true, tools: yearNav,
         footer: `<span class="muted hint-inline">已實現損益＝賣出交割金額－賣出股數的平均成本（移動平均，含買進手續費）；外幣換算台幣</span>` })}
     </div>
@@ -1593,26 +1569,7 @@ function rebateBox(a, bank, year, list, yearNav) {
   });
 }
 
-// 手續費設定（折疊）：改完離開欄位就儲存；清空＝回到預設
-function feeSettingsBox(a) {
-  const f = feeSettings(a);
-  const d = FEE_DEFAULTS[accountCodes(a)[0]] ?? ZERO_FEES;
-  const input = (key, label, unit) => `<label class="fee-field">${label}
-    <span class="input-group"><input class="form-control input-sm" type="number" min="0" step="any" inputmode="decimal"
-      data-fee-field="${key}" data-fee-acc="${a.id}" value="${a[key] ?? ""}" placeholder="${d[key]}">
-    <span class="input-group-addon input-sm addon-right">${unit}</span></span></label>`;
-  const code = accountCodes(a)[0] ?? BASE;
-  return `<details class="fee-settings">
-    <summary>手續費設定：手續費 ${f.fee_rate}%${f.fee_min ? `（最低 ${money(f.fee_min, code)}）` : ""}、賣出${taxLabel(code)} ${f.tax_rate}%</summary>
-    <div class="fee-row">${input("fee_rate", "手續費率", "%")}${input("fee_min", "最低手續費", symbol(code))}${input("tax_rate", `賣出${taxLabel(code)}率`, "%")}</div>
-    <p class="muted hint">${code === BASE
-      ? "台股預設手續費 0.1425%（最低 20 元）、證交稅 0.3%。券商有折扣就改手續費率，例如 2.8 折填 0.0399；ETF 證交稅是 0.1%，賣出時請手動改。"
-      : "外幣帳戶預設全部 0（例如美股免佣券商）。美股賣出另有 SEC 與 FINRA 的小額規費，通常只有幾美分，可照成交單填在「規費」。"}
-      清空欄位＝回到預設。</p>
-  </details>`;
-}
-
-// 交易表單：切換買賣、股票，輸入成交價金時自動估算手續費、稅與交割金額
+// 交易表單：切換買賣、股票；交割金額已含手續費與稅，顯示含費均價
 function bindTradeForm(a) {
   const form = $("[data-trade-form]");
   if (!form) return;
@@ -1628,23 +1585,12 @@ function bindTradeForm(a) {
     if ($("#tr-inv-row")) $("#tr-inv-row").hidden = s !== "buy";
     $("#tr-new").hidden = Boolean(f.holding_id.value) || f.holding_id.disabled;
     f.symbol.required = !$("#tr-new").hidden;
-    $("#tr-tax-row").hidden = s !== "sell";
     const code = codeOf();
-    const gross = Number(f.gross.value) || 0;
-    const est = estimateCosts(a, s, gross, code);
-    const f0 = feeSettings(a);
-    $("#tr-tax-label").textContent = tr(taxLabel(code));
-    $("#tr-hint").textContent = tr(code === BASE
-      ? `依手續費設定估算：手續費 ${f0.fee_rate}%（最低 ${f0.fee_min} 元）、證交稅 ${f0.tax_rate}%（ETF 是 0.1%），請改成券商實際收的金額。`
-      : `依手續費設定估算（目前手續費 ${f0.fee_rate}%、規費 ${f0.tax_rate}%）。美股賣出的 SEC、FINRA 規費通常只有幾美分，請照成交單填寫。`);
-    if (!f.fee.dataset.touched) f.fee.value = gross ? est.fee : "";
-    if (!f.tax.dataset.touched) f.tax.value = gross && s === "sell" ? est.tax : "";
-    const fee = Number(f.fee.value) || 0, tax = s === "sell" ? Number(f.tax.value) || 0 : 0;
-    const amount = s === "buy" ? gross + fee : gross - fee - tax;
+    const amount = Number(f.amount.value) || 0;
     const shares = Number(f.shares.value) || 0;
-    $("#tr-amount").innerHTML = gross
-      ? `${s === "buy" ? "扣款" : "入帳"} ${money(amount, code)}${shares >= 1 ? ` <small class="muted">（含費均價 ${money(Math.round((amount / shares) * 100) / 100, code)}）</small>` : ""}`
-      : "—";
+    const rule = s === "buy" ? "買進填實際扣款（成交價金＋手續費）" : "賣出填實際入帳（成交價金－手續費－證交稅）";
+    $("#tr-hint").innerHTML = esc(tr(rule)) + (amount && shares >= 1
+      ? `<br>${esc(tr("含費均價"))} ${money(Math.round((amount / shares) * 100) / 100, code)}` : "");
   };
   // 選了定期定額：股票自動切到同代號的持股，還沒持有就改成「其他股票」並填入代號
   f.investment_id?.addEventListener("change", () => {
@@ -1659,10 +1605,7 @@ function bindTradeForm(a) {
     }
   });
   form.addEventListener("change", update);
-  form.addEventListener("input", (e) => {
-    if (e.target === f.fee || e.target === f.tax) e.target.dataset.touched = "1";
-    update();
-  });
+  form.addEventListener("input", update);
   update();
 }
 
@@ -3437,13 +3380,6 @@ $("#content").addEventListener("change", (e) => {
   if (cur) return mutate(() => putJson(`/api/currencies/${cur.dataset.curId}`, { [cur.dataset.curField]: cur.value }));
   const hold = e.target.closest("[data-hold-field]");
   if (hold) return mutate(() => putJson(`/api/holdings/${hold.dataset.holdId}`, { [hold.dataset.holdField]: hold.value }));
-  const fee = e.target.closest("[data-fee-field]");
-  if (fee) {
-    return mutate(async () => {
-      await putJson(`/api/accounts/${fee.dataset.feeAcc}`, { [fee.dataset.feeField]: fee.value });
-      state.flash = ["success", "已儲存手續費設定"];
-    }, () => { const d = $(".fee-settings"); if (d) d.open = true; });
-  }
   const inv = e.target.closest("[data-inv-field]");
   if (inv) return mutate(() => putJson(`/api/investments/${inv.dataset.invId}`, { [inv.dataset.invField]: inv.value }));
   const fc = e.target.closest("[data-fc-field]");
@@ -3511,8 +3447,8 @@ $("#content").addEventListener("submit", (e) => {
     e.preventDefault();
     const side = form.querySelector('input[name="side"]:checked').value;
     const body = {
-      account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value, gross: f.gross.value,
-      fee: f.fee.value || 0, tax: side === "sell" ? f.tax.value || 0 : 0, note: f.note.value,
+      account_id: form.dataset.tradeForm, side, date: f.date.value, shares: f.shares.value,
+      gross: f.amount.value, fee: 0, tax: 0, note: f.note.value, // 交割金額已含手續費與稅
       investment_id: side === "buy" ? f.investment_id?.value || null : null,
     };
     if (f.holding_id.value) body.holding_id = f.holding_id.value;
