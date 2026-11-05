@@ -276,6 +276,8 @@ function balanceBase(id) {
 }
 // ----- 證券戶持股 -----
 const holdingsOf = (id) => state.holdings.filter((h) => h.account_id === id);
+// 已出清：有股票交易、股數賣到 0；持股表與交易表單不再列出（有交易不能刪，紀錄保留）
+const isClosed = (h) => Math.abs(h.shares) < 1e-9 && state.trades.some((t) => t.holding_id === h.id);
 const marketValue = (h) => h.shares * h.price;
 const profit = (h) => marketValue(h) - h.cost;
 const holdingsBase = (id) => holdingsOf(id).reduce((s, h) => s + toBase(marketValue(h), h.currency), 0);
@@ -1335,7 +1337,8 @@ function txForm(type, preset, { date = today(), embedded = false, entry = null }
 
 // 證券戶的持股表：代號、名稱、股數、成本、價格可直接改（離開欄位自動儲存），其餘自動計算
 function holdingsBox(a) {
-  const list = holdingsOf(a.id);
+  const list = holdingsOf(a.id).filter((h) => !isClosed(h));
+  const closed = holdingsOf(a.id).filter(isClosed);
   const field = (h, key, cls, numeric = true) =>
     `<input class="form-control input-sm ${cls}" data-hold-field="${key}" data-hold-id="${h.id}" value="${esc(h[key])}"${
       numeric ? ' type="number" step="any" min="0" inputmode="decimal"' : ""}>`;
@@ -1397,6 +1400,7 @@ function holdingsBox(a) {
       <select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, accountCodes(a)[0] ?? BASE)}</select>
       <button class="btn btn-default" type="submit">${icon("plus")} 新增持股</button>
     </form>
+    ${closed.length ? `<p class="muted hint">已出清 ${closed.length} 檔（不顯示）：${closed.map((h) => esc(h.symbol)).join("、")}，交易紀錄保留；要再買進，記錄股票交易時選「其他股票」輸入代號即可。</p>` : ""}
     <p class="muted hint">代號依幣別判斷市場：台幣填 2330（上市上櫃自動判斷）、美金填 AAPL、港幣填 700、日幣填 7203；也可直接填 Yahoo 代號如 0700.HK。購買成本＝總成本（含手續費）。表格內數字改完自動儲存，拖曳 ⠿ 排序。有股票交易紀錄的股票，股數與成本由交易自動計算；手動修改會調整交易之前的期初持股。</p>`,
   });
 }
@@ -1476,7 +1480,8 @@ function tradeSection(a, bank) {
   const codes = accountCodes(bank);
   // 這個證券戶（或沒指定證券戶）的定期定額；暫停的只在修改原本就標記它的交易時列出
   const plans = state.investments.filter((p) => (p.account_id === a.id || p.account_id == null) && (p.active || editing?.investment_id === p.id));
-  const holdingOptions = holdings.map((h) => `<option value="${h.id}" data-currency="${esc(h.currency)}" data-symbol="${esc(h.symbol.toUpperCase())}"${editing && editing.holding_id === h.id ? " selected" : ""}>
+  const tradable = holdings.filter((h) => !isClosed(h) || editing?.holding_id === h.id);
+  const holdingOptions = tradable.map((h) => `<option value="${h.id}" data-currency="${esc(h.currency)}" data-symbol="${esc(h.symbol.toUpperCase())}"${editing && editing.holding_id === h.id ? " selected" : ""}>
     ${esc(holdingLabel(h))}（持有 ${shareText(h.shares)} 股）</option>`).join("");
   const form = `<form class="trade-form" data-trade-form="${a.id}" autocomplete="off">
       <div class="form-group"><label>買賣</label><div class="btn-group" role="radiogroup">
@@ -1491,7 +1496,7 @@ function tradeSection(a, bank) {
         <select class="form-control" id="tr-holding" name="holding_id"${editing ? " disabled" : ""}>${holdingOptions}
           ${editing ? "" : `<option value="">＋ 其他股票（輸入代號）</option>`}</select>
       </div></div>
-      <div class="form-group" id="tr-new"${holdings.length || editing ? " hidden" : ""}><label for="tr-symbol">代號</label><div class="input-row">
+      <div class="form-group" id="tr-new"${tradable.length || editing ? " hidden" : ""}><label for="tr-symbol">代號</label><div class="input-row">
         <input class="form-control" id="tr-symbol" name="symbol" placeholder="代號，例如 2330">
         <select class="form-control cur-select" name="currency" aria-label="幣別">${currencyOptions(codes, codes[0] ?? BASE)}</select>
       </div></div>
