@@ -281,6 +281,14 @@ const isClosed = (h) => Math.abs(h.shares) < 1e-9 && state.trades.some((t) => t.
 const marketValue = (h) => h.shares * h.price;
 const profit = (h) => marketValue(h) - h.cost;
 const holdingsBase = (id) => holdingsOf(id).reduce((s, h) => s + toBase(marketValue(h), h.currency), 0);
+// 證券戶頁顯示用的幣別：持股全是同一種幣別就用它（例如美股券商顯示 US$），混合幣別才換算台幣
+// 只影響證券戶頁的顯示；淨資產、側欄、資產快照仍用台幣
+function holdingsDisplay(list) {
+  const codes = [...new Set(list.map((h) => h.currency))];
+  const code = codes.length === 1 ? codes[0] : BASE;
+  const conv = (h, n) => (code === BASE ? toBase(n, h.currency) : n);
+  return { code, value: list.reduce((s, h) => s + conv(h, marketValue(h)), 0), cost: list.reduce((s, h) => s + conv(h, h.cost), 0) };
+}
 // 帳戶總值（台幣）= 各幣別現金 + 持股市值
 // 保險：儲蓄型有填保單價值就以保單價值為準；保障型不算資產
 const policyOf = (id) => state.policies.find((p) => p.account_id === id)
@@ -1364,9 +1372,8 @@ function holdingsBox(a) {
     </tr>`;
   }).join("");
 
-  const cost = list.reduce((s, h) => s + toBase(h.cost, h.currency), 0);
-  const value = holdingsBase(a.id);
-  const foreign = list.some((h) => h.currency !== BASE);
+  const { code: totalCode, value, cost } = holdingsDisplay(list);
+  const foreign = totalCode === BASE && list.some((h) => h.currency !== BASE);
   const table = list.length
     ? `<div class="table-wrap"><table class="table table-hover holdings">
         <thead><tr><th class="handle-cell"></th><th>代號</th><th>名稱</th><th>股數</th><th>購買成本</th>
@@ -1374,9 +1381,9 @@ function holdingsBox(a) {
         <tbody id="holdingSort">${rows}</tbody>
         <tfoot><tr>
           <td></td><td colspan="3"><strong>合計</strong>${foreign ? ` <span class="muted">（換算台幣）</span>` : ""}</td>
-          <td class="amount nowrap">${money(cost)}</td><td></td><td></td>
-          <td class="text-right nowrap amount">${money(value)}</td>
-          <td class="text-right nowrap">${plText(value - cost)}</td>
+          <td class="amount nowrap">${money(cost, totalCode)}</td><td></td><td></td>
+          <td class="text-right nowrap amount">${money(value, totalCode)}</td>
+          <td class="text-right nowrap">${plText(value - cost, totalCode)}</td>
           <td class="text-right nowrap">${cost ? plPct(((value - cost) / cost) * 100) : "—"}</td><td></td>
         </tr></tfoot>
       </table></div>`
@@ -2193,14 +2200,17 @@ function accountPage(arg) {
 
   // 證券戶：多顯示持股市值與未實現損益
   const isSecurities = a.kind === "securities";
-  const holdingCost = holdingsOf(a.id).reduce((s, h) => s + toBase(h.cost, h.currency), 0);
-  const holdingPl = holdingsBase(a.id) - holdingCost;
+  const hd = holdingsDisplay(holdingsOf(a.id));
+  const holdingPl = hd.value - hd.cost;
+  // 外幣顯示時附上換算台幣
+  const twd = (n) => (hd.code === BASE ? "" : `≈ ${money(toBase(n, hd.code))}`);
+  const worth = securitiesDisplayWorth(a);
   const holdingBoxes = isSecurities && holdingsOf(a.id).length
-    ? infoBox("blue", "chart", "持股市值", money(holdingsBase(a.id)),
-      `帳戶總值 ${money(securitiesDisplayWorth(a))}${bank ? "（含交割戶）" : ""}`)
+    ? infoBox("blue", "chart", "持股市值", money(hd.value, hd.code),
+      `${hd.code === BASE ? "" : `${twd(hd.value)}・`}帳戶總值 ${hd.code === BASE ? money(worth) : money(worth / rate(hd.code), hd.code)}${bank ? "（含交割戶）" : ""}`)
       + infoBox(holdingPl >= 0 ? "red" : "green", holdingPl >= 0 ? "in" : "out", "未實現損益",
-        `<span>${holdingPl > 0 ? "+" : ""}${money(holdingPl)}</span>`,
-        holdingCost ? `報酬率 ${holdingPl > 0 ? "+" : ""}${((holdingPl / holdingCost) * 100).toFixed(2)}%` : "")
+        `<span>${holdingPl > 0 ? "+" : ""}${money(holdingPl, hd.code)}</span>`,
+        [hd.cost ? `報酬率 ${holdingPl > 0 ? "+" : ""}${((holdingPl / hd.cost) * 100).toFixed(2)}%` : "", twd(holdingPl)].filter(Boolean).join("・"))
     : "";
 
   // 銀行帳戶：設定它是哪個證券戶的交割戶
