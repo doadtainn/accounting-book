@@ -1466,6 +1466,64 @@ function plEngine(a) {
   return { code, dates, valueAt, between, period };
 }
 
+// 損益圖：長條＝每期損益（紅漲綠跌），折線＝累計；資料在 plSection 算好放這裡，頁面 after() 再依容器寬度畫
+const plCharts = {};
+const plChartBox = (key) => `<div class="pl-chart">
+    <div class="legend snap-legend"><span><i style="background:var(--stock-up)"></i>獲利</span><span><i style="background:var(--stock-down)"></i>虧損</span>
+      <span><i class="legend-line" style="background:var(--series-1)"></i>${plCharts[key].name}（折線）</span></div>
+    <div class="snap-chart-wrap" data-pl-chart="${key}"></div></div>`;
+function plAxis(n, code) {
+  if (state.privacy) return "•••";
+  if (code === BASE && Math.abs(n) >= 1e4) return `${+(n / 1e4).toFixed(1)}萬`;
+  return n.toLocaleString("zh-TW", { maximumFractionDigits: Math.abs(n) < 10 ? 2 : 0 });
+}
+function drawPlChart(el) {
+  const { code, name, rows } = plCharts[el.dataset.plChart];
+  const W = Math.max(300, el.clientWidth), mobile = W < 560;
+  const H = mobile ? 220 : 260, L = 56, R = 14, T = 14, B = 28;
+  const { lo, hi, ticks } = niceScale(rows.flatMap((r) => (r.pl == null ? [] : [r.pl, r.cum])));
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const slot = (W - L - R) / rows.length;
+  const xAt = (i) => L + slot * i + slot / 2;
+  const bw = Math.max(3, Math.min(28, slot * 0.6));
+  let svg = `<svg class="snap-chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`;
+  ticks.forEach((v) => {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>
+      <text class="axis" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${plAxis(v, code)}</text>`;
+  });
+  const every = Math.max(1, Math.ceil(rows.length / (mobile ? 6 : 12)));
+  rows.forEach((r, i) => {
+    if (i % every === 0 || i === rows.length - 1) svg += `<text class="axis" x="${xAt(i)}" y="${H - 8}" text-anchor="middle">${r.label}</text>`;
+    if (r.pl == null) return;
+    const top = y(Math.max(0, r.pl)), bottom = y(Math.min(0, r.pl));
+    svg += `<rect x="${xAt(i) - bw / 2}" y="${top}" width="${bw}" height="${Math.max(1, bottom - top)}" rx="2" style="fill:var(${r.pl < 0 ? "--stock-down" : "--stock-up"})"/>`;
+  });
+  svg += `<line class="zero" x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}"/>`;
+  const pts = rows.map((r, i) => (r.cum == null ? null : [xAt(i), y(r.cum)])).filter(Boolean);
+  svg += `<polyline class="snap-line" points="${pts.map((p) => p.join(",")).join(" ")}" style="stroke:var(--series-1)"/>`;
+  svg += pts.map(([cx, cy]) => `<circle class="snap-dot" cx="${cx}" cy="${cy}" r="3.5" style="fill:var(--series-1)"/>`).join("");
+  svg += `<line class="crosshair" x1="0" x2="0" y1="${T}" y2="${H - B}" visibility="hidden"/>
+    <rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/></svg>`;
+  el.innerHTML = svg;
+
+  const tip = $(".chart-tip") ?? document.body.appendChild(Object.assign(document.createElement("div"), { className: "chart-tip" }));
+  tip.hidden = true;
+  const svgEl = el.querySelector("svg"), cross = el.querySelector(".crosshair");
+  svgEl.addEventListener("mousemove", (e) => {
+    const box = svgEl.getBoundingClientRect();
+    const i = Math.min(rows.length - 1, Math.max(0, Math.floor((((e.clientX - box.left) / box.width) * W - L) / slot)));
+    const r = rows[i];
+    if (r.pl == null) { tip.hidden = true; cross.setAttribute("visibility", "hidden"); return; }
+    cross.setAttribute("x1", xAt(i));
+    cross.setAttribute("x2", xAt(i));
+    cross.setAttribute("visibility", "visible");
+    tip.innerHTML = `<strong>${esc(r.tip)}</strong><br>損益 ${plText(r.pl, code)}<br>${name} ${plText(r.cum, code)}`;
+    tip.hidden = false;
+    placeTip(tip, e);
+  });
+  svgEl.addEventListener("mouseleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+}
+
 const plCell = (v, code) => (v == null ? `<span class="muted">—</span>` : plText(v, code));
 const pctCell = (p) => (p == null ? `<span class="muted">—</span>` : plPct(p));
 
@@ -1488,6 +1546,8 @@ function plSection(a) {
   const dailyRows = dates.filter((d) => d.startsWith(m) && d < t && idx(d) > 0)
     .map((d) => ({ label: d, ...e.between(dates[idx(d) - 1], d) }));
   if (t.startsWith(m) && day) dailyRows.push({ label: `${t}（即時）`, ...day });
+  let cum = 0;
+  plCharts.daily = { code, name: "當月累計", rows: dailyRows.map((r) => ({ label: snapLabel(r.label.slice(0, 10)), tip: r.label, pl: r.pl, cum: (cum += r.pl) })) };
   dailyRows.reverse();
   const dailyTable = dailyRows.length
     ? `<div class="table-wrap"><table class="table table-hover pl-table">
@@ -1511,6 +1571,9 @@ function plSection(a) {
     if (end === undefined) return { ym };
     return { ym, ...e.period(`${ym}-01`, end) };
   });
+  cum = 0;
+  plCharts.monthly = { code, name: "全年累計", rows: months.map((r) => ({ label: `${Number(r.ym.slice(5))}月`, tip: `${year} 年 ${Number(r.ym.slice(5))} 月`,
+    pl: r.pl ?? null, cum: r.pl === undefined ? null : (cum += r.pl) })) };
   const yearEnd = year === t.slice(0, 4) ? null : dates.filter((d) => d.startsWith(year)).pop();
   const yearRow = yearEnd === undefined ? null : e.period(`${year}-01-01`, yearEnd);
   const monthTable = `<div class="table-wrap"><table class="table table-hover pl-table">
@@ -1538,8 +1601,8 @@ function plSection(a) {
       ${boxFor(yr && yr.pl < 0 ? "green" : "red", "scale", "本年損益", yr)}
       ${infoBox("blue", "stock", "目前持股市值", money(e.valueAt(null), code), `收盤價紀錄 ${dates[0]} ～ ${dates[dates.length - 1]}`)}
     </div>
-    ${box(`${icon("calendar")} 每日損益`, dailyTable, { cls: "box-primary", flush: true, tools: monthNav() })}
-    ${box(`${icon("chart")} 每月損益`, monthTable, { cls: "box-warning", flush: true, tools: yearNav })}
+    ${box(`${icon("calendar")} 每日損益`, (dailyRows.length ? plChartBox("daily") : "") + dailyTable, { cls: "box-primary", flush: true, tools: monthNav() })}
+    ${box(`${icon("chart")} 每月損益`, (yearRow ? plChartBox("monthly") : "") + monthTable, { cls: "box-warning", flush: true, tools: yearNav })}
     <p class="muted hint">損益＝期末市值－期初市值＋賣出－買進＋折讓款，包含已實現與未實現（交割金額已含手續費與稅）。市值用每天的收盤價計算；本日是即時價格對比上一個收盤日。${code === BASE && holdingsOf(a.id).some((h) => h.currency !== BASE) ? "外幣用目前匯率換算台幣。" : ""}</p>`;
 }
 
@@ -2365,6 +2428,7 @@ function accountPage(arg, tab) {
       makeSortable($("#holdingSort"), "/api/holdings/order", { handle: ".drag-handle" });
       if (a.kind === "loan") bindLoanForms(a);
       if (a.kind === "securities" && tab !== "pl") bindTradeForm(a);
+      if (a.kind === "securities" && tab === "pl") document.querySelectorAll("[data-pl-chart]").forEach(drawPlChart);
       if (a.kind === "insurance") bindPolicyForms(a);
     },
     html: isSecurities && tab === "pl" ? secTabs(a, tab) + plSection(a) : `
@@ -2900,8 +2964,8 @@ const snapLabel = (date) => `${Number(date.slice(5, 7))}/${Number(date.slice(8))
 const snapAxis = (n) => (state.privacy ? "•••" : Math.abs(n) >= 1e4 ? `${+(n / 1e4).toFixed(0)}萬` : Math.round(n).toLocaleString("zh-TW"));
 
 // 數值軸：含 0，往外取整到好看的刻度（四個項目共用同一個軸，都是台幣）
-function snapScale(rows) {
-  const values = rows.flatMap((r) => SNAP_SERIES.map((s) => r[s.key]));
+const snapScale = (rows) => niceScale(rows.flatMap((r) => SNAP_SERIES.map((s) => r[s.key])));
+function niceScale(values) {
   let lo = Math.min(0, ...values), hi = Math.max(0, ...values);
   if (hi === lo) hi = lo + 1;
   const raw = (hi - lo) / 5;

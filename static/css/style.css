@@ -290,6 +290,7 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .tag-dca { color: var(--aqua); border-color: var(--aqua); }
 .tab-bar { margin-bottom: 14px; }
 .pl-table { min-width: 560px; }
+.pl-chart { padding: 10px 12px 4px; border-bottom: 1px solid var(--line); }
 .row-editing td { background: var(--surface-2); }
 .trade-list { min-width: 860px; }
 .trade-months { min-width: 620px; }
