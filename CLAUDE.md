@@ -33,7 +33,7 @@
 | 支出／收入頁 | 上方分類佔比環形圖（依分類／依帳戶）；點一塊開明細：子分類佔比、與上月比較、該分類每筆交易（金額由大到小）；下方是紀錄 |
 | 新增／修改交易 | 支出／收入／轉帳；主分類＋子分類；帳戶＋幣別（**不列證券戶**，證券戶只做股票交易）；跨幣別轉帳（換匯）要填轉入金額；轉入貸款可勾「額外還款」。交易列表每列有 ✏️ 修改（`#/edit/<id>`，存完回 `state.returnTo`）；貸款還款、利息、保費鎖住不能改（`entryLocked()`／`_entry_locked()`） |
 | 一般帳戶頁 | 各幣別餘額、本月流入流出、交易紀錄、幣別與初始餘額；銀行可設定為某證券戶的「證券交割戶」 |
-| 證券戶頁 | 持股表（已出清＝有交易且股數 0 的不顯示，見 `isClosed()`，交易表單也不列；代號、名稱、股數、成本、價格可直接改；均價、市值、損益、報酬率自動算；持股全是同一種外幣時，持股市值、未實現損益、合計用該幣別顯示（`holdingsDisplay()`，只影響這頁）；下市標記；拖曳排序；更新股價）；**股票交易**（買進／賣出，只填股數與**交割金額**（已含手續費與稅，顯示含費均價），本月／今年／累計已實現損益、每月損益表、交易紀錄可修改刪除；**必須綁定交割戶**）；有交割戶時顯示銀行餘額與交易 |
+| 證券戶頁 | 持股表（已出清＝有交易且股數 0 的不顯示，見 `isClosed()`，交易表單也不列；代號、名稱、股數、成本、價格可直接改；均價、市值、損益、報酬率自動算；持股全是同一種外幣時，持股市值、未實現損益、合計用該幣別顯示（`holdingsDisplay()`，只影響這頁）；下市標記；拖曳排序；更新股價）；**股票交易**（買進／賣出，只填股數與**交割金額**（已含手續費與稅，顯示含費均價），本月／今年／累計已實現損益、每月損益表、交易紀錄可修改刪除；**必須綁定交割戶**）；有交割戶時顯示銀行餘額與交易。上方分頁「總覽／損益」：**損益**（`#/account/<id>/pl`，`plSection()`／`plEngine()`）顯示本日／本月／本年損益、每日損益（切月份）、每月損益（切年份）；損益＝期末市值－期初市值＋賣出－買進＋折讓款，某天市值＝當天股數（期初＋當天以前的買賣重算）× `price_history` 收盤價 |
 | 信用卡頁 | 目前欠款、自動扣款（自動入帳／提醒確認） |
 | 貸款頁 | 貸款設定、記錄還款（本期／額外）、還款進度、還款紀錄（核對期數、標示同月重複、刪除整筆、重新編號並重算利息）、與銀行核對剩餘本金 |
 | 保險頁 | 保單設定、繳保費、繳費紀錄、下次繳費日；儲蓄型顯示保單價值與解約損益 |
@@ -80,6 +80,7 @@
 | `investments` | 固定投資（定期定額）：`account_id` 證券戶（可 NULL）、`symbol`、`name`、`currency`、`amount` 每次金額、`days` 扣款日（逗號分隔、排序去重，31 號遇小月算月底）、`active`、`sort`。只用於統計；刪帳戶時 `account_id` 設 NULL。股票交易用 `trades.investment_id` 標記屬於哪個定期定額。 |
 | `autopays` | 自動扣款（每月 `day` 號、金額、分類、`auto_post` 自動入帳或提醒、`last_posted` 已記到哪天）。 |
 | `settings` | 系統設定 key/value：`snapshot_time`（HH:MM）、`snapshot_enabled`（1／0）、`tz_offset`（與 UTC 相差的分鐘，台灣 480）。 |
+| `price_history` | 股價歷史（主鍵 `date`＋`holding_id`）：每天收盤價，日期是交易所當地日期。`backfill_prices()` 從開始記帳那天（最早的資產紀錄或交易）補抓 Yahoo 日線，已有的只重抓最近 7 天；開機與每日排程都會跑，`POST /api/prices/refresh` 可手動。已下市的不抓。刪持股時一併刪除。 |
 | `asset_snapshots` | 每日資產快照（主鍵 `date`）：`cash`、`securities`、`insurance`（儲蓄型保單價值）、`debt`、`net`，都是台幣；`auto` 1 排程／0 手動。 |
 
 ### 遷移規則
@@ -105,8 +106,8 @@
 
 全部在 `/api/...`，JSON；錯誤回 400 `{"error": "中文訊息"}`。
 
-- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／trades／rebates／loans／policies／autopays／fixedcosts／investments／snapshots／settings
-- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、rebates、trades（`holding_id`，或新股票給 `symbol`＋`currency`，買進時自動建持股）、autopays、fixedcosts、investments、snapshots（手動記錄今天）；`currencies/refresh`；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
+- `GET` entries（`?month=YYYY-MM`，空字串＝全部）／categories／accounts（含 `currencies` 陣列）／currencies／holdings／trades／rebates／loans／policies／autopays／fixedcosts／investments／prices／snapshots／settings
+- `POST` entries、categories、accounts、currencies（匯率留空自動查）、holdings、rebates、trades（`holding_id`，或新股票給 `symbol`＋`currency`，買進時自動建持股）、autopays、fixedcosts、investments、snapshots（手動記錄今天）；`currencies/refresh`；`prices/refresh`（補抓股價歷史）；`holdings/refresh`（`{account_id?}`）；`accounts/<id>/currencies`；`loans/<id>/payments|recalculate|reconcile`；`policies/<id>/payments`；`autopays/<id>/post`
 - `PUT` `settings`；`<表>/<id>`（含 `entries/<id>` 修改交易、`trades/<id>`）；`<accounts|categories|currencies|holdings|autopays|fixedcosts|investments>/order`（`{ids}` 拖曳排序）；`accounts/<id>/currencies/<代碼>`（初始餘額）
 - `DELETE` `<表>/<id>`；`accounts/<id>/currencies/<代碼>`；`loans/<id>/payments/<轉帳id>`（本金＋配對利息一起刪）
 - 刪除有保護：帳戶有交易、股票交易或持股不能刪；持股有股票交易不能刪；幣別被使用不能刪；帳戶最後一個幣別不能移除。

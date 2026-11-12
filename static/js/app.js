@@ -103,7 +103,7 @@ const shiftMonth = (m, delta) => {
 };
 
 // ===== 資料 =====
-const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], investments: [], snapshots: [], settings: {}, trades: [], rebates: [], month: today().slice(0, 7), flash: null };
+const state = { entries: [], categories: [], accounts: [], currencies: [], holdings: [], loans: [], policies: [], autopays: [], fixedcosts: [], investments: [], prices: [], snapshots: [], settings: {}, trades: [], rebates: [], month: today().slice(0, 7), flash: null };
 // 隱私模式：金額顯示成 *****；開關記在這台裝置（手機設了不影響電腦）
 const MASK = "*****";
 state.privacy = (() => {
@@ -333,7 +333,7 @@ async function api(path, opts = {}) {
   return data;
 }
 async function reload() {
-  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades, state.rebates, state.investments] = await Promise.all([
+  [state.entries, state.categories, state.accounts, state.currencies, state.holdings, state.loans, state.policies, state.autopays, state.fixedcosts, state.snapshots, state.settings, state.trades, state.rebates, state.investments, state.prices] = await Promise.all([
     api("/api/entries?month="),
     api("/api/categories"),
     api("/api/accounts"),
@@ -348,6 +348,7 @@ async function reload() {
     api("/api/trades"),
     api("/api/rebates"),
     api("/api/investments"),
+    api("/api/prices"),
   ]);
   tzOffset = Number(state.settings.tz_offset);
 }
@@ -1419,6 +1420,129 @@ const shareText = (n) => (state.privacy ? MASK : Number(n).toLocaleString("zh-TW
 const holdingLabel = (h) => (h ? `${h.symbol} ${h.name}`.trim() : "（已刪除的股票）");
 const realizedBase = (list) => list.filter((t) => t.side === "sell").reduce((s, t) => s + toBase(t.realized, t.currency), 0);
 
+// ===== 證券戶損益（本日／本月／本年與歷史）=====
+// 損益 = 期末市值 − 期初市值 ＋ 賣出交割金額 − 買進交割金額 ＋ 折讓款（含已實現與未實現；手續費、稅已含在交割金額）
+// 某天的市值 = 當天股數（期初持股＋當天以前的買賣，事後補記的交易也算得對）× 當天收盤價（price_history，缺的往前找）
+function plEngine(a) {
+  const holdings = holdingsOf(a.id);
+  const { code } = holdingsDisplay(holdings);
+  const conv = (n, c) => (code === BASE ? toBase(n, c) : n);
+  const series = new Map(holdings.map((h) => [h.id, []]));
+  state.prices.forEach((p) => series.get(p.holding_id)?.push(p)); // 伺服器已依日期排序
+  const dates = [...new Set(state.prices.filter((p) => series.has(p.holding_id)).map((p) => p.date))].sort();
+  const trades = tradesOf(a.id);
+  const rebates = rebatesOf(a.id);
+  const sharesAt = (h, d) => trades.reduce((s, t) => s + (t.holding_id === h.id && t.date <= d ? (t.side === "buy" ? t.shares : -t.shares) : 0), h.base_shares);
+  const priceAt = (h, d) => {
+    const list = series.get(h.id);
+    let p = null;
+    for (const x of list) { if (x.date > d) break; p = x.price; }
+    return p ?? list[0]?.price ?? h.price; // 沒有更早的價格：用最早一筆，沒有歷史（例如已下市）用目前價格
+  };
+  // 現在的價格：目前價格和收盤價紀錄哪個新就用哪個（股價沒更新時不會拿舊價格比新收盤價）
+  const priceNow = (h) => {
+    const last = series.get(h.id).at(-1);
+    return last && (!h.price_time || last.date > h.price_time.slice(0, 10)) ? last.price : h.price;
+  };
+  // d 為 null 代表現在（目前股數 × 現在的價格）
+  const valueAt = (d) => holdings.reduce((s, h) => s + conv(d ? sharesAt(h, d) * priceAt(h, d) : h.shares * priceNow(h), h.currency), 0);
+  const inRange = (x, from, to) => x.date > from && (!to || x.date <= to);
+  const sumTrades = (side, from, to) => trades.filter((t) => t.side === side && inRange(t, from, to)).reduce((s, t) => s + conv(t.amount, t.currency), 0);
+  const sumRebates = (from, to) => rebates.filter((r) => inRange(r, from, to)).reduce((s, r) => s + conv(r.amount, r.currency), 0);
+  // from、to 都是有收盤價的日期；to 為 null 代表到現在
+  const between = (from, to) => {
+    const start = valueAt(from), end = valueAt(to), buy = sumTrades("buy", from, to), sell = sumTrades("sell", from, to);
+    const pl = end - start + sell - buy + sumRebates(from, to);
+    const base = start + buy;
+    return { from, to, start, end, buy, sell, pl, pct: base > 0 ? (pl / base) * 100 : null };
+  };
+  // 期間（periodStart 起，到 to 或現在）：期初用期間開始前最後一個收盤日；資料比期間晚開始就從第一天起算（partial）
+  const period = (periodStart, to = null) => {
+    const before = dates.filter((d) => d < periodStart).pop();
+    const from = before ?? dates.find((d) => d >= periodStart && (!to || d <= to));
+    if (!from || (to && from >= to && before === undefined)) return null;
+    return { ...between(from, to), partial: before === undefined };
+  };
+  return { code, dates, valueAt, between, period };
+}
+
+const plCell = (v, code) => (v == null ? `<span class="muted">—</span>` : plText(v, code));
+const pctCell = (p) => (p == null ? `<span class="muted">—</span>` : plPct(p));
+
+function plSection(a) {
+  const e = plEngine(a);
+  const { code, dates } = e;
+  if (!dates.length) {
+    return box(`${icon("chart")} 損益`, `<p class="empty">還沒有股價歷史。伺服器每天更新股價時會自動補抓收盤價，也可以現在手動補抓。</p>
+      <p class="text-center"><button class="btn btn-primary" data-backfill-prices>${icon("refresh")} 補抓股價歷史</button></p>`, { cls: "box-primary" });
+  }
+  const t = today();
+  const sinceNote = (r) => (r?.partial ? `自 ${r.from} 起算` : "");
+  const boxFor = (color, iconName, label, r) => infoBox(color, iconName, label, r ? plText(r.pl, code) : "—",
+    r ? [r.pct == null ? "" : `報酬率 ${r.pct > 0 ? "+" : ""}${r.pct.toFixed(2)}%`, sinceNote(r)].filter(Boolean).join("・") : "沒有資料");
+  const day = e.period(t), mon = e.period(`${t.slice(0, 7)}-01`), yr = e.period(`${t.slice(0, 4)}-01-01`);
+
+  // 每日損益（state.month）：每個收盤日對比前一個收盤日；今天加一列即時
+  const m = state.month;
+  const idx = (d) => dates.indexOf(d);
+  const dailyRows = dates.filter((d) => d.startsWith(m) && d < t && idx(d) > 0)
+    .map((d) => ({ label: d, ...e.between(dates[idx(d) - 1], d) }));
+  if (t.startsWith(m) && day) dailyRows.push({ label: `${t}（即時）`, ...day });
+  dailyRows.reverse();
+  const dailyTable = dailyRows.length
+    ? `<div class="table-wrap"><table class="table table-hover pl-table">
+        <thead><tr><th>日期</th><th class="text-right">市值</th><th class="text-right">買進</th><th class="text-right">賣出</th>
+          <th class="text-right">損益</th><th class="text-right">報酬率</th></tr></thead>
+        <tbody>${dailyRows.map((r) => `<tr>
+          <td class="nowrap">${r.label}</td><td class="text-right amount">${money(r.end, code)}</td>
+          <td class="text-right amount">${r.buy ? money(r.buy, code) : "—"}</td>
+          <td class="text-right amount">${r.sell ? money(r.sell, code) : "—"}</td>
+          <td class="text-right">${plCell(r.pl, code)}</td><td class="text-right">${pctCell(r.pct)}</td></tr>`).join("")}</tbody>
+        <tfoot><tr><td colspan="4"><strong>${monthLabel(m)}合計</strong></td>
+          <td class="text-right"><strong>${plText(dailyRows.reduce((s, r) => s + r.pl, 0), code)}</strong></td><td></td></tr></tfoot>
+      </table></div>`
+    : `<p class="empty">${monthLabel(m)}沒有損益紀錄</p>`;
+
+  // 每月損益（年份與股票交易共用 state.tradeYear）
+  const year = state.tradeYear ?? state.month.slice(0, 4);
+  const months = Array.from({ length: 12 }, (_, i) => `${year}-${pad2(i + 1)}`).map((ym) => {
+    if (ym > t.slice(0, 7)) return { ym };
+    const end = ym === t.slice(0, 7) ? null : dates.filter((d) => d.startsWith(ym)).pop();
+    if (end === undefined) return { ym };
+    return { ym, ...e.period(`${ym}-01`, end) };
+  });
+  const yearEnd = year === t.slice(0, 4) ? null : dates.filter((d) => d.startsWith(year)).pop();
+  const yearRow = yearEnd === undefined ? null : e.period(`${year}-01-01`, yearEnd);
+  const monthTable = `<div class="table-wrap"><table class="table table-hover pl-table">
+      <thead><tr><th>月份</th><th class="text-right">期初市值</th><th class="text-right">期末市值</th><th class="text-right">買進</th>
+        <th class="text-right">賣出</th><th class="text-right">損益</th><th class="text-right">報酬率</th></tr></thead>
+      <tbody>${months.map((r) => r.pl === undefined
+        ? `<tr class="row-muted"><td>${Number(r.ym.slice(5))} 月</td><td colspan="6" class="text-right muted">—</td></tr>`
+        : `<tr><td class="nowrap">${Number(r.ym.slice(5))} 月${r.partial ? ` <small class="muted">（自 ${r.from.slice(5)}）</small>` : ""}${r.to ? "" : ` <small class="muted">（至今）</small>`}</td>
+          <td class="text-right amount">${money(r.start, code)}</td><td class="text-right amount">${money(r.end, code)}</td>
+          <td class="text-right amount">${r.buy ? money(r.buy, code) : "—"}</td><td class="text-right amount">${r.sell ? money(r.sell, code) : "—"}</td>
+          <td class="text-right">${plCell(r.pl, code)}</td><td class="text-right">${pctCell(r.pct)}</td></tr>`).join("")}</tbody>
+      ${yearRow ? `<tfoot><tr><td><strong>${year} 年</strong>${yearRow.partial ? ` <small class="muted">（自 ${yearRow.from.slice(5)}）</small>` : ""}</td>
+        <td class="text-right amount">${money(yearRow.start, code)}</td><td class="text-right amount">${money(yearRow.end, code)}</td>
+        <td class="text-right amount">${money(yearRow.buy, code)}</td><td class="text-right amount">${money(yearRow.sell, code)}</td>
+        <td class="text-right"><strong>${plText(yearRow.pl, code)}</strong></td><td class="text-right">${pctCell(yearRow.pct)}</td></tr></tfoot>` : ""}
+    </table></div>`;
+  const yearNav = `<div class="btn-group">
+      <button class="btn btn-default btn-sm" data-trade-year="-1" aria-label="前一年">‹</button>
+      <span class="btn btn-default btn-sm static">${year} 年</span>
+      <button class="btn btn-default btn-sm" data-trade-year="1" aria-label="後一年">›</button></div>`;
+
+  return `<div class="grid grid-4">
+      ${boxFor(day && day.pl < 0 ? "green" : "red", "calendar", "本日損益", day)}
+      ${boxFor(mon && mon.pl < 0 ? "green" : "red", "chart", "本月損益", mon)}
+      ${boxFor(yr && yr.pl < 0 ? "green" : "red", "scale", "本年損益", yr)}
+      ${infoBox("blue", "stock", "目前持股市值", money(e.valueAt(null), code), `收盤價紀錄 ${dates[0]} ～ ${dates[dates.length - 1]}`)}
+    </div>
+    ${box(`${icon("calendar")} 每日損益`, dailyTable, { cls: "box-primary", flush: true, tools: monthNav() })}
+    ${box(`${icon("chart")} 每月損益`, monthTable, { cls: "box-warning", flush: true, tools: yearNav })}
+    <p class="muted hint">損益＝期末市值－期初市值＋賣出－買進＋折讓款，包含已實現與未實現（交割金額已含手續費與稅）。市值用每天的收盤價計算；本日是即時價格對比上一個收盤日。${code === BASE && holdingsOf(a.id).some((h) => h.currency !== BASE) ? "外幣用目前匯率換算台幣。" : ""}</p>`;
+}
+
 function tradeSection(a, bank) {
   if (!bank) {
     const banks = accountsOf("bank");
@@ -2117,7 +2241,7 @@ function bindPolicyForms(a) {
   });
 }
 
-function accountPage(arg) {
+function accountPage(arg, tab) {
   const a = findAccount(arg);
   if (!a) return { title: "帳戶", crumbs: ["首頁", "帳戶"], html: `<p class="empty">找不到這個帳戶</p>` };
   const k = ACCOUNT_KINDS[a.kind];
@@ -2240,10 +2364,11 @@ function accountPage(arg) {
     after() {
       makeSortable($("#holdingSort"), "/api/holdings/order", { handle: ".drag-handle" });
       if (a.kind === "loan") bindLoanForms(a);
-      if (a.kind === "securities") bindTradeForm(a);
+      if (a.kind === "securities" && tab !== "pl") bindTradeForm(a);
       if (a.kind === "insurance") bindPolicyForms(a);
     },
-    html: `
+    html: isSecurities && tab === "pl" ? secTabs(a, tab) + plSection(a) : `
+      ${isSecurities ? secTabs(a, tab) : ""}
       ${a.kind === "insurance" ? policySection(a) : `<div class="grid grid-4">
         ${holdingBoxes}
         ${balanceBoxes}
@@ -2266,6 +2391,10 @@ function accountPage(arg) {
       ${box(`${icon("coin")} 幣別與初始餘額${bank ? `<small class="muted">　證券戶自身（已連結交割戶，通常應為 0）</small>` : ""}`, currencyTable, { cls: "box-default", flush: true, footer: addCurrency })}`,
   };
 }
+
+// 證券戶頁的分頁：總覽（#/account/<id>）、損益（#/account/<id>/pl）
+const secTabs = (a, tab) => `<div class="btn-group tab-bar">${[["", "總覽"], ["pl", "損益"]].map(([k, label]) =>
+  `<a class="btn btn-sm ${(tab ?? "") === k ? "btn-primary" : "btn-default"}" href="#/account/${a.id}${k ? `/${k}` : ""}">${label}</a>`).join("")}</div>`;
 
 function addAccountForm(kind) {
   const k = ACCOUNT_KINDS[kind];
@@ -3185,6 +3314,12 @@ $("#content").addEventListener("click", async (e) => {
       await api(`/api/rebates/${r.id}`, { method: "DELETE" });
       if (state.editRebate === r.id) state.editRebate = null;
       state.flash = ["success", "已刪除折讓款"];
+    });
+  }
+  if (e.target.closest("[data-backfill-prices]")) {
+    return mutate(async () => {
+      const r = await postJson("/api/prices/refresh", {});
+      state.flash = ["success", `已補抓 ${r.count} 筆收盤價`];
     });
   }
   const tradeYear = e.target.closest("[data-trade-year]");

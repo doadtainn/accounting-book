@@ -288,6 +288,8 @@ body.privacy input[type="number"]:not(:focus):not(:placeholder-shown) { filter: 
 .tag-buy { color: var(--stock-up); border-color: var(--stock-up); }
 .tag-sell { color: var(--stock-down); border-color: var(--stock-down); }
 .tag-dca { color: var(--aqua); border-color: var(--aqua); }
+.tab-bar { margin-bottom: 14px; }
+.pl-table { min-width: 560px; }
 .row-editing td { background: var(--surface-2); }
 .trade-list { min-width: 860px; }
 .trade-months { min-width: 620px; }

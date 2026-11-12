@@ -40,6 +40,7 @@ CURRENCY_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
 
 # 股價來源：Yahoo Finance（非官方公開 API，免金鑰；若哪天失效需換來源）
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=1d"
+YAHOO_HISTORY_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}?period1={}&period2={}&interval=1d"
 # 台股中文名稱：Yahoo 只有英文，改用證交所（上市）與櫃買中心（上櫃）的每日收盤資料：(網址, 代號欄, 名稱欄)
 TW_NAME_SOURCES = [
     ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "Code", "Name"),
@@ -240,6 +241,13 @@ AUTOPAYS_SQL = """CREATE TABLE IF NOT EXISTS autopays (
 )"""
 AUTOPAY_KINDS = ("credit", "bank")
 # 資產變化：每天設定的時間（settings.snapshot_time，預設 17:00）先更新股價，再記錄一次資產（台幣）。auto = 1 排程記的，0 手動記的（17:00 會覆蓋）
+# 股價歷史：每檔持股每天的收盤價（日期是交易所當地日期），證券戶「損益」分頁用來算每天的市值
+PRICE_HISTORY_SQL = """CREATE TABLE IF NOT EXISTS price_history (
+    date TEXT NOT NULL,
+    holding_id INTEGER NOT NULL,
+    price REAL NOT NULL,
+    PRIMARY KEY (date, holding_id)
+)"""
 SNAPSHOTS_SQL = """CREATE TABLE IF NOT EXISTS asset_snapshots (
     date TEXT PRIMARY KEY,
     cash REAL NOT NULL,
@@ -405,6 +413,7 @@ def init_db():
         conn.execute(FIXED_COSTS_SQL)
         conn.execute(INVESTMENTS_SQL)
         conn.execute(SNAPSHOTS_SQL)
+        conn.execute(PRICE_HISTORY_SQL)
         conn.execute(TRADES_SQL)
         conn.execute(REBATES_SQL)
         if "investment_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}:
@@ -546,6 +555,68 @@ def fetch_quote(symbol, currency):
             "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "",
         }
     return None
+
+
+def fetch_history(symbol, currency, start):
+    """向 Yahoo 查 start（date）起每天的收盤價，回傳 {日期: 價格}；日期用交易所當地日期，查不到回傳 {}。"""
+    period1 = int(datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp())
+    period2 = int(time.time()) + 86400
+    for yahoo in yahoo_symbols(symbol, currency):
+        url = YAHOO_HISTORY_URL.format(urllib.parse.quote(yahoo), period1, period2)
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=15) as res:
+                result = json.load(res)["chart"]["result"][0]
+            offset = result["meta"].get("gmtoffset") or 0
+            closes = result["indicators"]["quote"][0].get("close") or []
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            continue
+        prices = {
+            datetime.fromtimestamp(ts + offset, timezone.utc).date().isoformat(): round(float(close), 4)
+            for ts, close in zip(result.get("timestamp") or [], closes) if close is not None
+        }
+        if prices:
+            return prices
+    return {}
+
+
+_history_lock = threading.Lock()
+
+
+def backfill_prices():
+    """補抓股價歷史：從開始記帳那天（最早的資產紀錄或股票交易）起；已有歷史的只重抓最近 7 天（蓋掉盤中價）。
+    已下市的略過（前端用目前價格）。回傳寫入的筆數。"""
+    with _history_lock:
+        with db() as conn:
+            first = conn.execute(
+                "SELECT MIN(d) FROM (SELECT MIN(date) AS d FROM asset_snapshots UNION ALL SELECT MIN(date) FROM trades)"
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT h.id, h.symbol, h.currency, (SELECT MAX(date) FROM price_history p WHERE p.holding_id = h.id) AS last "
+                "FROM holdings h WHERE h.delisted = 0"
+            ).fetchall()
+        start = date.fromisoformat(first) if first else local_today() - timedelta(days=7)
+
+        def job(r):
+            since = max(start, date.fromisoformat(r["last"]) - timedelta(days=7)) if r["last"] else start
+            return r["id"], fetch_history(r["symbol"], r["currency"], since)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(job, rows))
+        count = 0
+        with db() as conn:
+            for holding_id, prices in results:
+                rows = [(d, holding_id, p) for d, p in prices.items() if d >= start.isoformat()]
+                conn.executemany("INSERT OR REPLACE INTO price_history (date, holding_id, price) VALUES (?, ?, ?)", rows)
+                count += len(rows)
+        return count
+
+
+def backfill_prices_safely():
+    try:
+        print(f"股價歷史：補抓 {backfill_prices()} 筆")
+    except Exception as err:  # 查不到就等下次排程
+        print("補抓股價歷史失敗：", err)
 
 
 def replay_holding(conn, holding_id, base_shares, base_cost, write=False):
@@ -774,6 +845,7 @@ def take_snapshot(auto, refresh=True):
                 failed = refresh_prices()[1]
             except Exception as err:  # 查不到股價就用目前的價格，不影響記錄
                 print("更新股價失敗：", err)
+            backfill_prices_safely()  # 順便補最近幾天的收盤價（證券戶損益用）
         now = local_now()
         with db() as conn:
             t = asset_totals(conn)
@@ -917,6 +989,10 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 rows = conn.execute("SELECT * FROM loans").fetchall()
             return self._json([dict(r) for r in rows])
+        if url.path == "/api/prices":
+            with db() as conn:
+                rows = conn.execute("SELECT date, holding_id, price FROM price_history ORDER BY date, holding_id").fetchall()
+            return self._json([dict(r) for r in rows])
         if url.path == "/api/holdings":
             with db() as conn:
                 rows = conn.execute("SELECT * FROM holdings ORDER BY sort, id").fetchall()
@@ -935,6 +1011,7 @@ class Handler(SimpleHTTPRequestHandler):
             ("accounts",): self._create_account,
             ("holdings",): self._create_holding,
             ("holdings", "refresh"): self._refresh_prices,
+            ("prices", "refresh"): lambda data: self._json({"count": backfill_prices()}),  # 手動補抓股價歷史
             ("currencies",): self._create_currency,
             ("currencies", "refresh"): self._refresh_rates,
             ("trades",): self._create_trade,
@@ -1805,6 +1882,7 @@ class Handler(SimpleHTTPRequestHandler):
             n = conn.execute("SELECT COUNT(*) FROM trades WHERE holding_id = ?", (id_,)).fetchone()[0]
             if n:
                 raise ValueError(f"這檔股票還有 {n} 筆交易紀錄，請先刪除交易才能刪除持股")
+            conn.execute("DELETE FROM price_history WHERE holding_id = ?", (id_,))
             conn.execute("DELETE FROM holdings WHERE id = ?", (id_,))
         self._json({"ok": True})
 
@@ -2114,6 +2192,7 @@ def start_server(port=PORT):
     init_db()
     process_autopays()
     threading.Thread(target=snapshot_scheduler, daemon=True).start()
+    threading.Thread(target=backfill_prices_safely, daemon=True).start()  # 開機補抓股價歷史（第一次會從開始記帳那天抓起）
     return ThreadingHTTPServer(("0.0.0.0", port), Handler)
 
 
